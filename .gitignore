@@ -1,0 +1,8 @@
+# Gold Trader
+.env
+__pycache__/
+*.pyc
+st.log
+st.err
+pip_st.log
+pip_st_err.log
