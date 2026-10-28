@@ -8,26 +8,12 @@ import numpy as np
 import time
 import logging
 import os
-import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+from bot_state import _get_bot_state
+
 load_dotenv()
-
-CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_control.json")
-
-def _get_bot_state():
-    try:
-        with open(CONTROL_FILE, "r") as f:
-            data = json.load(f)
-            return bool(data.get("running", True))
-    except Exception:
-        try:
-            with open(CONTROL_FILE, "w") as f:
-                json.dump({"running": True}, f)
-        except Exception:
-            pass
-        return True
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

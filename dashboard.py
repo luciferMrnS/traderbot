@@ -9,28 +9,31 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from datetime import datetime, timedelta
 import os
 import yfinance as yf
-import json
+import threading
+import time
 from dotenv import load_dotenv
+
+from gold_trader import GoldTrader
+from bot_state import get_bot_state, set_bot_state
 
 load_dotenv()
 
-CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_control.json")
+# Start the trading bot in a background thread (single web service deployment)
+@st.cache_resource
+def start_bot_thread():
+    def run_bot():
+        try:
+            trader = GoldTrader(paper=True, symbol="GLD")
+            trader.run(loop=True, interval=60)
+        except Exception as e:
+            print(f"Bot thread error: {e}")
+    
+    thread = threading.Thread(target=run_bot, daemon=True)
+    thread.start()
+    return thread
 
-def get_bot_state():
-    try:
-        with open(CONTROL_FILE, "r") as f:
-            data = json.load(f)
-            return bool(data.get("running", True))
-    except Exception:
-        set_bot_state(True)
-        return True
-
-def set_bot_state(running: bool):
-    try:
-        with open(CONTROL_FILE, "w") as f:
-            json.dump({"running": bool(running)}, f)
-    except Exception:
-        pass
+# Initialize bot thread on app startup
+start_bot_thread()
 
 # Page Config
 st.set_page_config(page_title="Gold Trader Dashboard", layout="wide", page_icon="🥇")
@@ -198,8 +201,10 @@ st.json({
     "Position Size": "10% of equity",
     "Stop Loss": "2% (disabled for fractional)",
     "Take Profit": "4% (disabled for fractional)",
-    "Mode": "Paper Trading" if connected else "Demo"
+    "Mode": "Paper Trading" if connected else "Demo",
+    "Deployment": "Single Web Service (in-thread)"
 })
+st.caption("Bot runs in background thread alongside dashboard. Toggle 'Bot Running' in sidebar to pause/resume.")
 
 # Auto-Refresh Logic
 if auto_refresh and connected:
