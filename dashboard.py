@@ -164,23 +164,33 @@ if positions:
 else:
     st.info("No open positions.")
 
-# Recent Orders
-st.subheader("Recent Orders")
-orders = get_recent_orders()
-if orders:
-    order_data = []
-    for o in orders:
-        order_data.append({
-            "ID": str(o.id)[:8] + "...", 
-            "Symbol": o.symbol,
-            "Side": str(o.side), 
-            "Qty": o.qty, 
-            "Status": str(o.status), 
-            "Submitted": str(o.submitted_at)[:19] if o.submitted_at else ""
-        })
-    st.dataframe(order_data, use_container_width=True)
-else:
-    st.info("No recent orders.")
+# Orders History
+st.subheader("Orders History")
+try:
+    if connected and trading_cli:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=50)
+        all_orders = trading_cli.get_orders(filter=req)
+        if all_orders:
+            order_data = []
+            for o in all_orders:
+                order_data.append({
+                    "ID": str(o.id)[:8] + "...",
+                    "Symbol": o.symbol,
+                    "Side": str(o.side).replace('OrderSide.', ''),
+                    "Qty": getattr(o, 'qty', None),
+                    "Type": str(o.type).replace('OrderType.', '') if hasattr(o, 'type') else '',
+                    "Status": str(o.status).replace('OrderStatus.', ''),
+                    "Submitted": str(getattr(o, 'submitted_at', ''))[:19]
+                })
+            st.dataframe(order_data, use_container_width=True)
+        else:
+            st.info("No orders found.")
+    else:
+        st.info("Not connected to Alpaca.")
+except Exception as e:
+    st.warning(f"Could not load orders: {e}")
 
 # SMA/RSI Status
 st.subheader("Technical Indicators (SMA 12/26 + RSI 14)")
