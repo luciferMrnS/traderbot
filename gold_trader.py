@@ -8,12 +8,29 @@ import numpy as np
 import time
 import logging
 import os
+import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from bot_state import _get_bot_state
 
 load_dotenv()
+
+REGIME_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "regime_state.json")
+
+def _load_regime_state():
+    try:
+        with open(REGIME_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_regime_state(state):
+    try:
+        with open(REGIME_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -200,49 +217,65 @@ class GoldTrader:
             
             positions = self.trading_client.get_all_positions()
             position = next((pos for pos in positions if pos.symbol == self.symbol), None)
+            pos_side = str(getattr(position, 'side', '')).lower() if position else None
             
             if signal == 'BUY':
-                if position:
-                    logger.info("Already holding position. Skipping BUY.")
+                if position and pos_side == 'long':
+                    logger.info("Already long. Skipping BUY.")
                     return
-                    
+                if position and pos_side == 'short':
+                    qty_to_cover = float(position.qty)
+                    logger.info(f"Covering short {qty_to_cover} {self.symbol} to flip long.")
+                    cover_req = trading_requests.MarketOrderRequest(
+                        symbol=self.symbol,
+                        qty=qty_to_cover,
+                        side=trading_enums.OrderSide.BUY,
+                        time_in_force=trading_enums.TimeInForce.DAY
+                    )
+                    self.trading_client.submit_order(cover_req)
                 qty = self._calculate_position_size(equity, current_price)
                 if qty == 0:
                     logger.warning("Insufficient equity or invalid price for position sizing.")
                     return
-                    
                 logger.info(f"Executing BUY {qty} {self.symbol} @ ${current_price:.2f}")
-                
-                stop_price = round(current_price * (1 - self.stop_loss_pct), 2)
-                take_profit_price = round(current_price * (1 + self.take_profit_pct), 2)
-                
                 order_request = trading_requests.MarketOrderRequest(
                     symbol=self.symbol,
                     qty=qty,
                     side=trading_enums.OrderSide.BUY,
                     time_in_force=trading_enums.TimeInForce.DAY
                 )
-                
                 order = self.trading_client.submit_order(order_request)
                 logger.info(f"Order Submitted: ID {order.id}")
+                return
                 
             elif signal == 'SELL':
-                if not position:
-                    logger.info("No position to close. Skipping SELL.")
+                if position and pos_side == 'short':
+                    logger.info("Already short. Skipping SELL.")
                     return
-                    
-                qty_to_sell = float(position.qty)
-                logger.info(f"Executing SELL {qty_to_sell} {self.symbol} to close position.")
-                
+                if position and pos_side == 'long':
+                    qty_to_sell = float(position.qty)
+                    logger.info(f"Closing long {qty_to_sell} {self.symbol} to flip short.")
+                    close_req = trading_requests.MarketOrderRequest(
+                        symbol=self.symbol,
+                        qty=qty_to_sell,
+                        side=trading_enums.OrderSide.SELL,
+                        time_in_force=trading_enums.TimeInForce.DAY
+                    )
+                    self.trading_client.submit_order(close_req)
+                qty = self._calculate_position_size(equity, current_price)
+                if qty == 0:
+                    logger.warning("Insufficient equity or invalid price for position sizing.")
+                    return
+                logger.info(f"Executing SHORT {qty} {self.symbol} @ ${current_price:.2f}")
                 order_request = trading_requests.MarketOrderRequest(
                     symbol=self.symbol,
-                    qty=qty_to_sell,
+                    qty=qty,
                     side=trading_enums.OrderSide.SELL,
-                    time_in_force=trading_enums.TimeInForce.GTC
+                    time_in_force=trading_enums.TimeInForce.DAY
                 )
-                
                 order = self.trading_client.submit_order(order_request)
                 logger.info(f"Order Submitted: ID {order.id}")
+                return
         except Exception as e:
             logger.error(f"Trade execution failed: {e}", exc_info=True)
 
@@ -251,6 +284,8 @@ class GoldTrader:
         Main loop. Fetches data, calculates indicators, generates signal, and executes.
         """
         logger.info(f"Starting Gold Trader for {self.symbol}...")
+        regime_state = _load_regime_state()
+        last_regime = regime_state.get(self.symbol)
         
         while loop:
             try:
@@ -269,6 +304,22 @@ class GoldTrader:
                 logger.info(f"Data received. Last Price: ${df.iloc[-1]['Close']:.2f}")
                 
                 df = self._calculate_indicators(df)
+                if len(df) >= self.slow_ma + 1 and not pd.isna(df.iloc[-1]['SMA_Fast']) and not pd.isna(df.iloc[-1]['SMA_Slow']):
+                    fast = df.iloc[-1]['SMA_Fast']
+                    slow = df.iloc[-1]['SMA_Slow']
+                    current_regime = 'bull' if fast > slow else ('bear' if fast < slow else last_regime)
+                    if last_regime and current_regime and current_regime != last_regime:
+                        logger.info(f"Regime change detected: {last_regime} -> {current_regime}. Checking for trade action.")
+                        rsi = df.iloc[-1]['RSI'] if not pd.isna(df.iloc[-1]['RSI']) else 50
+                        if current_regime == 'bear' and rsi > self.rsi_oversold:
+                            logger.info("Acting on regime change -> SELL")
+                            self._execute_trade('SELL', df)
+                        elif current_regime == 'bull' and rsi < self.rsi_overbought:
+                            logger.info("Acting on regime change -> BUY")
+                            self._execute_trade('BUY', df)
+                    last_regime = current_regime
+                    regime_state[self.symbol] = last_regime
+                    _save_regime_state(regime_state)
                 signal = self._generate_signal(df)
                 self._execute_trade(signal, df)
                 

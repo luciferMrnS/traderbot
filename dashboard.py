@@ -182,6 +182,34 @@ if orders:
 else:
     st.info("No recent orders.")
 
+# SMA/RSI Status
+st.subheader("Technical Indicators (SMA 12/26 + RSI 14)")
+try:
+    trader = GoldTrader(paper=True, symbol=SYMBOL)
+    df = trader._get_data(limit=200)
+    if not df.empty:
+        df_ind = trader._calculate_indicators(df.copy())
+        if len(df_ind) > 0:
+            last = df_ind.iloc[-1]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Close", f"${float(last['Close']):.2f}")
+            c2.metric("SMA Fast (12)", f"${float(last['SMA_Fast']):.2f}" if pd.notna(last.get('SMA_Fast')) else "N/A")
+            c3.metric("SMA Slow (26)", f"${float(last['SMA_Slow']):.2f}" if pd.notna(last.get('SMA_Slow')) else "N/A")
+            c4.metric("RSI (14)", f"{float(last['RSI']):.2f}" if pd.notna(last.get('RSI')) else "N/A")
+            if pd.notna(last.get('SMA_Fast')) and pd.notna(last.get('SMA_Slow')):
+                if last['SMA_Fast'] > last['SMA_Slow']:
+                    st.info("SMA Fast > SMA Slow (Bullish)")
+                elif last['SMA_Fast'] < last['SMA_Slow']:
+                    st.info("SMA Fast < SMA Slow (Bearish)")
+                else:
+                    st.info("SMA Fast == SMA Slow")
+        else:
+            st.info("Not enough data to calculate indicators.")
+    else:
+        st.info("No data available for indicators.")
+except Exception as e:
+    st.warning(f"Could not load indicators: {e}")
+
 # Price Chart
 st.subheader(f"Live Price ({SYMBOL}) - Last 24h")
 price_df = get_price_data()
