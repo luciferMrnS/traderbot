@@ -9,9 +9,28 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from datetime import datetime, timedelta
 import os
 import yfinance as yf
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
+
+CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_control.json")
+
+def get_bot_state():
+    try:
+        with open(CONTROL_FILE, "r") as f:
+            data = json.load(f)
+            return bool(data.get("running", True))
+    except Exception:
+        set_bot_state(True)
+        return True
+
+def set_bot_state(running: bool):
+    try:
+        with open(CONTROL_FILE, "w") as f:
+            json.dump({"running": bool(running)}, f)
+    except Exception:
+        pass
 
 # Page Config
 st.set_page_config(page_title="Gold Trader Dashboard", layout="wide", page_icon="🥇")
@@ -101,6 +120,11 @@ else:
 
 # Sidebar Controls
 st.sidebar.header("Controls")
+bot_running = get_bot_state()
+new_state = st.sidebar.toggle("Bot Running", value=bot_running, key="bot_toggle")
+if new_state != bot_running:
+    set_bot_state(new_state)
+    st.sidebar.success(f"Bot {'started' if new_state else 'stopped'}")
 auto_refresh = st.sidebar.toggle("Auto-Refresh (30s)", value=True)
 if st.sidebar.button("Refresh Now"):
     st.rerun()
