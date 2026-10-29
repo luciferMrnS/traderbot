@@ -18,6 +18,173 @@ from bot_state import get_bot_state, set_bot_state
 
 load_dotenv()
 
+# Page Config
+st.set_page_config(page_title="Gold Trader Dashboard", layout="wide", page_icon="🥇")
+
+st.markdown(
+    """
+    <style>
+    :root {
+        --gold: #d7ad58;
+        --gold-bright: #f0cb78;
+        --ink: #101714;
+        --panel: #18211d;
+        --panel-raised: #1d2923;
+        --muted: #9aa99f;
+        --line: rgba(215, 173, 88, 0.18);
+        --green: #67d49a;
+        --red: #ff8585;
+        --text-color: #edf2ed;
+        --background-color: #101714;
+        --secondary-background-color: #18211d;
+        --primary-color: #d7ad58;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(ellipse at 82% 0%, rgba(108, 91, 48, 0.16), transparent 34rem),
+            linear-gradient(145deg, #101714 0%, #111a16 48%, #101512 100%);
+        color: #edf2ed;
+    }
+    [data-testid="stHeader"] { background: rgba(16, 23, 20, 0.72); }
+    [data-testid="stAppViewContainer"] .main .block-container {
+        max-width: 1500px;
+        padding: 2rem 2.5rem 4rem;
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #151e19 0%, #111814 100%);
+        border-right: 1px solid var(--line);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        color: var(--muted);
+    }
+    h1, h2, h3 { color: #f1f3ec !important; letter-spacing: -0.035em; }
+    h2 { font-size: 1.35rem !important; margin-top: 1.3rem !important; }
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li,
+    [data-testid="stWidgetLabel"] p { color: #dce5dd; }
+    [data-testid="stCaptionContainer"], small { color: var(--muted) !important; }
+
+    .hero {
+        position: relative;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1.5rem;
+        margin: 0.4rem 0 1.8rem;
+        padding: 1.7rem 2rem;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background:
+            radial-gradient(ellipse at 90% 10%, rgba(215,173,88,.19), transparent 34%),
+            linear-gradient(115deg, rgba(29,41,35,.98), rgba(19,28,23,.94));
+        box-shadow: 0 18px 50px rgba(0,0,0,.18);
+    }
+    .hero-kicker {
+        color: var(--gold-bright);
+        font-size: .72rem;
+        font-weight: 700;
+        letter-spacing: .18em;
+        text-transform: uppercase;
+        margin-bottom: .45rem;
+    }
+    .hero-title {
+        color: #f4f2e9;
+        font-size: clamp(1.7rem, 3vw, 2.5rem);
+        font-weight: 700;
+        letter-spacing: -.055em;
+        line-height: 1.08;
+    }
+    .hero-copy { color: #aab8ae; margin-top: .55rem; font-size: .94rem; }
+    .hero-right { display: flex; flex-direction: column; align-items: flex-end; gap: .55rem; }
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: .5rem;
+        padding: .5rem .85rem;
+        border: 1px solid rgba(103,212,154,.25);
+        border-radius: 999px;
+        color: #a5e8c1;
+        background: rgba(103,212,154,.09);
+        font-size: .78rem;
+        font-weight: 650;
+        white-space: nowrap;
+    }
+    .status-pill.offline {
+        border-color: rgba(255,133,133,.25);
+        color: #ffb0a7;
+        background: rgba(255,133,133,.08);
+    }
+    .status-dot {
+        width: .48rem;
+        height: .48rem;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 12px rgba(103,212,154,.55);
+    }
+    .status-pill.offline .status-dot {
+        background: var(--red);
+        box-shadow: 0 0 12px rgba(255,133,133,.45);
+    }
+    .hero-mode { color: var(--muted); font-size: .75rem; }
+
+    [data-testid="stMetric"] {
+        min-height: 112px;
+        padding: 1rem 1.1rem;
+        border: 1px solid rgba(255,255,255,.07);
+        border-radius: 16px;
+        background: linear-gradient(145deg, rgba(29,41,35,.94), rgba(23,32,27,.94));
+        box-shadow: 0 8px 22px rgba(0,0,0,.12);
+    }
+    [data-testid="stMetricLabel"] p {
+        color: #9eada3 !important;
+        font-size: .78rem !important;
+        font-weight: 600 !important;
+    }
+    [data-testid="stMetricValue"] {
+        color: #f0cb78 !important;
+        font-size: 1.55rem !important;
+        font-weight: 680 !important;
+    }
+    [data-testid="stMetricDelta"] { font-size: .78rem !important; }
+    [data-testid="stDataFrame"], [data-testid="stTable"] {
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 14px;
+        overflow: hidden;
+        background: rgba(24,33,29,.7);
+    }
+    [data-testid="stAlert"] { border-radius: 13px; }
+    [data-testid="stBaseButton-secondary"], [data-testid="stFormSubmitButton"] button {
+        border: 1px solid rgba(215,173,88,.42) !important;
+        border-radius: 10px !important;
+        color: #f0cb78 !important;
+        background: rgba(215,173,88,.08) !important;
+        transition: all .18s ease;
+    }
+    [data-testid="stBaseButton-secondary"]:hover {
+        border-color: var(--gold-bright) !important;
+        background: rgba(215,173,88,.16) !important;
+        transform: translateY(-1px);
+    }
+    [data-testid="stToggle"] label p { color: #e2e8e2; font-weight: 550; }
+    [data-testid="stPlotlyChart"], [data-testid="stVegaLiteChart"] {
+        padding: .5rem;
+        border: 1px solid rgba(255,255,255,.07);
+        border-radius: 16px;
+        background: rgba(24,33,29,.62);
+    }
+    hr { border-color: rgba(255,255,255,.08) !important; }
+    @media (max-width: 700px) {
+        [data-testid="stAppViewContainer"] .main .block-container { padding: 1rem 1rem 3rem; }
+        .hero { align-items: flex-start; flex-direction: column; padding: 1.35rem; }
+        .hero-right { align-items: flex-start; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Start the trading bot in a background thread (single web service deployment)
 @st.cache_resource
 def start_bot_thread():
@@ -34,9 +201,6 @@ def start_bot_thread():
 
 # Initialize bot thread on app startup
 start_bot_thread()
-
-# Page Config
-st.set_page_config(page_title="Gold Trader Dashboard", layout="wide", page_icon="🥇")
 
 # --- Config ---
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -114,12 +278,27 @@ def get_price_data():
         return pd.DataFrame()
 
 # --- UI Layout ---
-st.title("🥇 Gold (GLD) Trading Bot Dashboard")
-
-if not connected:
-    st.warning("⚠️ Not connected to Alpaca. Using cached/demo data.")
-else:
-    st.success("✅ Connected to Alpaca Paper Trading")
+connection_class = "" if connected else "offline"
+connection_label = "Alpaca connected" if connected else "Alpaca unavailable"
+mode_label = "PAPER TRADING" if connected else "DEMO MODE"
+st.markdown(
+    f"""
+    <div class="hero">
+      <div>
+        <div class="hero-kicker">Precious metals · automated strategy</div>
+        <div class="hero-title">Gold Trading Desk</div>
+        <div class="hero-copy">GLD · EMA 50/200 trend · RSI pullback · 15-minute bars</div>
+      </div>
+      <div class="hero-right">
+        <div class="status-pill {connection_class}">
+          <span class="status-dot"></span>{connection_label}
+        </div>
+        <div class="hero-mode">{mode_label}</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Sidebar Controls
 st.sidebar.header("Controls")
@@ -133,6 +312,7 @@ if st.sidebar.button("Refresh Now"):
     st.rerun()
 
 # Main Metrics
+st.subheader("Account Overview")
 col1, col2, col3, col4 = st.columns(4)
 account = get_account()
 if account:
@@ -147,7 +327,9 @@ else:
     col4.metric("Status", "Demo")
 
 # Positions Table
-st.subheader("Open Positions")
+st.markdown("---")
+st.subheader("Portfolio")
+st.markdown("#### Open positions")
 positions = get_positions()
 if positions:
     pos_data = []
@@ -165,7 +347,7 @@ else:
     st.info("No open positions.")
 
 # Orders History
-st.subheader("Orders History")
+st.markdown("#### Recent orders")
 try:
     if connected and trading_cli:
         from alpaca.trading.requests import GetOrdersRequest
@@ -193,6 +375,7 @@ except Exception as e:
     st.warning(f"Could not load orders: {e}")
 
 # EMA/RSI Status
+st.markdown("---")
 st.subheader("Technical Indicators (EMA 50/200 + RSI/ATR 14)")
 try:
     trader = GoldTrader(paper=True, symbol=SYMBOL)
@@ -223,6 +406,7 @@ except Exception as e:
     st.warning(f"Could not load indicators: {e}")
 
 # Price Chart
+st.markdown("---")
 st.subheader(f"Live Price ({SYMBOL}) - Last 24h")
 price_df = get_price_data()
 if not price_df.empty and 'Close' in price_df.columns:
@@ -233,6 +417,7 @@ else:
     st.info("No price data available.")
 
 # Bot Info
+st.markdown("---")
 st.subheader("Bot Configuration")
 st.json({
     "Strategy": "EMA (50/200) trend + RSI (14) pullback",
