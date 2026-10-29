@@ -342,7 +342,25 @@ if positions:
             "Unrealized P&L": float(p.unrealized_pl),
             "P&L %": float(p.unrealized_plpc) * 100
         })
-    st.dataframe(pos_data, use_container_width=True)
+    positions_df = pd.DataFrame(pos_data)
+
+    def pnl_color(value):
+        if value < 0:
+            return "color: #ff8585; font-weight: 600"
+        if value > 0:
+            return "color: #67d49a; font-weight: 600"
+        return "color: #dce5dd"
+
+    styled_positions = positions_df.style.map(
+        pnl_color, subset=["Unrealized P&L", "P&L %"]
+    ).format({
+        "Qty": "{:,.2f}",
+        "Avg Price": "${:,.2f}",
+        "Market Value": "${:,.2f}",
+        "Unrealized P&L": "${:,.2f}",
+        "P&L %": "{:+.2f}%",
+    })
+    st.dataframe(styled_positions, use_container_width=True)
 else:
     st.info("No open positions.")
 
