@@ -2,6 +2,7 @@ import alpaca.trading.client as trading_client
 import alpaca.trading.requests as trading_requests
 import alpaca.trading.enums as trading_enums
 import alpaca.data.requests as adr
+import alpaca.data.enums as data_enums
 import alpaca.data.timeframe as timeframe
 import pandas as pd
 import numpy as np
@@ -9,28 +10,30 @@ import time
 import logging
 import os
 import json
-from datetime import datetime, timedelta
+import math
+import hashlib
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 from bot_state import _get_bot_state
 
 load_dotenv()
 
-REGIME_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "regime_state.json")
+STRATEGY_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_state.json")
 
-def _load_regime_state():
+def _load_strategy_state():
     try:
-        with open(REGIME_STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
+        with open(STRATEGY_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
         return {}
+    if not isinstance(state, dict):
+        raise ValueError(f"Invalid strategy state in {STRATEGY_STATE_FILE}")
+    return state
 
-def _save_regime_state(state):
-    try:
-        with open(REGIME_STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+def _save_strategy_state(state):
+    with open(STRATEGY_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -72,34 +75,44 @@ class GoldTrader:
             self.trading_client = None
             self.data_client = None
 
-        # Strategy Parameters
-        self.fast_ma = 12
-        self.slow_ma = 26
-        self.rsi_period = 14
-        self.rsi_overbought = 70
-        self.rsi_oversold = 30
-        self.position_size_pct = 0.1  # 10% of equity per trade
-        self.stop_loss_pct = 0.02     # 2% stop loss
-        self.take_profit_pct = 0.04   # 4% take profit
+        self.last_data_source = "not fetched"
 
-    def _get_data(self, limit=200):
+        # Strategy Parameters
+        self.fast_ema = 50
+        self.slow_ema = 200
+        self.rsi_period = 14
+        self.atr_period = 14
+        self.rsi_long_trigger = 40
+        self.rsi_short_trigger = 60
+        self.stop_atr_multiple = 1.5
+        self.target_atr_multiple = 3.0
+        self.risk_pct = 0.01
+        self.bar_minutes = 15
+
+    def _get_data(self, limit=1000):
         """
-        Fetch historical OHLCV data. Uses Alpaca if available, otherwise YFinance.
+        Fetch enough 15-minute OHLCV bars for the 200-period EMA.
         """
         if self.use_alpaca and self.data_client:
             try:
+                now = datetime.now(timezone.utc)
                 request = adr.StockBarsRequest(
                     symbol_or_symbols=[self.symbol],
-                    timeframe=timeframe.TimeFrame.Minute,
-                    start=datetime.utcnow() - timedelta(days=30),
-                    end=datetime.utcnow(),
-                    limit=limit
+                    timeframe=timeframe.TimeFrame(15, timeframe.TimeFrameUnit.Minute),
+                    start=now - timedelta(days=30),
+                    end=now,
+                    limit=limit,
+                    feed=data_enums.DataFeed.IEX,
                 )
                 response = self.data_client.get_stock_bars(request)
-                # Alpaca returns a dict of DataFrames
-                if self.symbol in response.data:
-                    df = response.data[self.symbol]
+                bars = response.data.get(self.symbol, [])
+                if bars:
+                    df = pd.DataFrame(
+                        [bar.model_dump(exclude={"symbol"}) for bar in bars]
+                    ).set_index("timestamp")
                     df.index = pd.to_datetime(df.index)
+                    df.columns = [str(column).title() for column in df.columns]
+                    self.last_data_source = "Alpaca IEX"
                     return df
             except Exception as e:
                 logger.error(f"Alpaca data fetch failed: {e}")
@@ -114,7 +127,7 @@ class GoldTrader:
             elif s.endswith('=X'):
                 tickers_to_try = [s, 'GC=F']
             else:
-                tickers_to_try = [s, 'GC=F']
+                tickers_to_try = [s]
             for ticker in tickers_to_try:
                 try:
                     df = yf.download(ticker, period="1mo", interval="15m", progress=False)
@@ -122,7 +135,9 @@ class GoldTrader:
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
+                    df.columns = [str(column).title() for column in df.columns]
                     logger.info(f"Using YFinance data from {ticker}")
+                    self.last_data_source = f"Yahoo Finance ({ticker})"
                     return df
                 except Exception:
                     continue
@@ -132,161 +147,283 @@ class GoldTrader:
             return pd.DataFrame()
 
     def _calculate_indicators(self, df):
-        """
-        Calculate technical indicators using pandas-ta or manual numpy.
-        """
         if df.empty:
             return df
-        
-        # Ensure columns are numeric
+
+        df = df.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [str(column).title() for column in df.columns]
+        required = {'High', 'Low', 'Close'}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"Missing OHLC columns required for indicators: {sorted(missing)}")
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Calculate Simple Moving Averages
-        df['SMA_Fast'] = df['Close'].rolling(window=self.fast_ma).mean()
-        df['SMA_Slow'] = df['Close'].rolling(window=self.slow_ma).mean()
-
-        # Calculate RSI
+        df['EMA_Fast'] = df['Close'].ewm(
+            span=self.fast_ema, adjust=False, min_periods=self.fast_ema
+        ).mean()
+        df['EMA_Slow'] = df['Close'].ewm(
+            span=self.slow_ema, adjust=False, min_periods=self.slow_ema
+        ).mean()
         delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_period).mean()
-        rs = gain / loss
+        gain = delta.clip(lower=0).ewm(
+            alpha=1 / self.rsi_period, adjust=False, min_periods=self.rsi_period
+        ).mean()
+        loss = -delta.clip(upper=0).ewm(
+            alpha=1 / self.rsi_period, adjust=False, min_periods=self.rsi_period
+        ).mean()
+        rs = gain.div(loss.replace(0, np.nan))
         df['RSI'] = 100 - (100 / (1 + rs))
+        df.loc[(loss == 0) & (gain > 0), 'RSI'] = 100
+        df.loc[(loss == 0) & (gain == 0), 'RSI'] = 50
+
+        previous_close = df['Close'].shift(1)
+        true_range = pd.concat(
+            [
+                df['High'] - df['Low'],
+                (df['High'] - previous_close).abs(),
+                (df['Low'] - previous_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df['ATR'] = true_range.ewm(
+            alpha=1 / self.atr_period, adjust=False, min_periods=self.atr_period
+        ).mean()
 
         return df
 
     def _generate_signal(self, df):
-        """
-        Generate a trading signal based on SMA Crossover + RSI Filter.
-        Returns: 'BUY', 'SELL', or 'HOLD'
-        """
-        if len(df) < self.slow_ma + 1:
+        if len(df) < self.slow_ema + 1:
             return 'HOLD'
-            
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2]
-        
-        # Drop NaN values for signal logic
-        if pd.isna(last_row['SMA_Fast']) or pd.isna(last_row['SMA_Slow']) or pd.isna(last_row['RSI']):
+        last_row, prev_row = df.iloc[-1], df.iloc[-2]
+        values = [
+            last_row['EMA_Fast'], last_row['EMA_Slow'], last_row['RSI'], last_row['ATR'],
+            prev_row['EMA_Fast'], prev_row['EMA_Slow'], prev_row['RSI'],
+        ]
+        if any(pd.isna(value) for value in values):
             return 'HOLD'
 
-        current_price = last_row['Close']
-        current_rsi = last_row['RSI']
-        fast_ma = last_row['SMA_Fast']
-        slow_ma = last_row['SMA_Slow']
-        
-        prev_fast = prev_row['SMA_Fast']
-        prev_slow = prev_row['SMA_Slow']
-
-        # Logic: Golden Cross (Fast crosses above Slow) + RSI not overbought
-        if prev_fast <= prev_slow and fast_ma > slow_ma and current_rsi < self.rsi_overbought:
-            logger.info(f"Signal: BUY (SMA Cross Up, RSI: {current_rsi:.2f})")
+        if (
+            last_row['EMA_Fast'] > last_row['EMA_Slow']
+            and prev_row['RSI'] <= self.rsi_long_trigger
+            and last_row['RSI'] > self.rsi_long_trigger
+        ):
+            logger.info("Signal: BUY (bull trend, RSI crossed above 40)")
             return 'BUY'
-            
-        # Logic: Death Cross (Fast crosses below Slow) + RSI not oversold
-        elif prev_fast >= prev_slow and fast_ma < slow_ma and current_rsi > self.rsi_oversold:
-            logger.info(f"Signal: SELL (SMA Cross Down, RSI: {current_rsi:.2f})")
+        if (
+            last_row['EMA_Fast'] < last_row['EMA_Slow']
+            and prev_row['RSI'] >= self.rsi_short_trigger
+            and last_row['RSI'] < self.rsi_short_trigger
+        ):
+            logger.info("Signal: SELL (bear trend, RSI crossed below 60)")
             return 'SELL'
-            
         return 'HOLD'
 
-    def _calculate_position_size(self, equity, price):
-        """
-        Calculate number of shares to buy based on equity and risk.
-        """
-        if equity <= 0 or price <= 0:
-            return 0
-        risk_amount = equity * self.position_size_pct
-        qty = risk_amount / price
-        return round(qty, 2)
+    def _closed_bars(self, df, now=None):
+        if df.empty:
+            return df
+        result = df.copy()
+        index = pd.DatetimeIndex(pd.to_datetime(result.index))
+        if index.tz is None:
+            index = index.tz_localize("America/New_York")
+        else:
+            index = index.tz_convert("UTC")
+        result.index = index
+        result = result.sort_index()
+        index = result.index
+        current_time = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+        if current_time.tzinfo is None:
+            current_time = current_time.tz_localize("UTC")
+        else:
+            current_time = current_time.tz_convert("UTC")
+        return result.loc[index + pd.Timedelta(minutes=self.bar_minutes) <= current_time]
 
-    def _execute_trade(self, signal, df):
-        """
-        Execute the trade via Alpaca or log it if in dry-run mode.
-        """
-        current_price = df.iloc[-1]['Close']
-        
+    def _calculate_position_size(self, equity, price, stop_distance, buying_power):
+        if equity <= 0 or price <= 0 or stop_distance <= 0 or buying_power <= 0:
+            return 0
+        risk_amount = equity * self.risk_pct
+        risk_limited_qty = math.floor(risk_amount / stop_distance)
+        buying_power_limited_qty = math.floor(buying_power / price)
+        return max(0, min(risk_limited_qty, buying_power_limited_qty))
+
+    def _open_symbol_orders(self):
+        return self.trading_client.get_orders(
+            filter=trading_requests.GetOrdersRequest(
+                status=trading_enums.QueryOrderStatus.OPEN,
+                limit=100,
+                symbols=[self.symbol],
+            )
+        )
+
+    def _close_position_for_reversal(self):
+        open_orders = self._open_symbol_orders()
+        for order in open_orders:
+            logger.info("Canceling open %s order %s before reversing.", self.symbol, order.id)
+            self.trading_client.cancel_order_by_id(order.id)
+
+        cancel_deadline = time.monotonic() + 30
+        while self._open_symbol_orders():
+            if time.monotonic() >= cancel_deadline:
+                logger.error("Timed out waiting for %s orders to cancel; will not reverse.", self.symbol)
+                return False
+            time.sleep(1)
+
+        close_order = self.trading_client.close_position(self.symbol)
+        close_order_id = getattr(close_order, "id", None)
+        if close_order_id is None:
+            logger.error("Alpaca did not return an order ID for the %s position close.", self.symbol)
+            return False
+
+        close_deadline = time.monotonic() + 30
+        while time.monotonic() < close_deadline:
+            order = self.trading_client.get_order_by_id(close_order_id)
+            status = str(order.status).split(".")[-1].lower()
+            positions = self.trading_client.get_all_positions()
+            position_still_open = any(
+                position.symbol == self.symbol for position in positions
+            )
+            if status == "filled" and not position_still_open:
+                logger.info("Closed existing %s position before reversing.", self.symbol)
+                return True
+            if status in {"canceled", "rejected", "expired"}:
+                logger.error("Position close order %s ended with status %s.", close_order_id, status)
+                return False
+            time.sleep(1)
+
+        logger.error(
+            "Timed out waiting for close order %s to fill; will not open the counter-position.",
+            close_order_id,
+        )
+        return False
+
+    def _execute_trade(self, signal, df, signal_bar_time=None):
+        last = df.iloc[-1]
+        current_price = float(last['Close'])
+        atr = float(last['ATR'])
+        stop_distance = atr * self.stop_atr_multiple
+        target_distance = atr * self.target_atr_multiple
+        if not math.isfinite(current_price) or not math.isfinite(stop_distance) or stop_distance <= 0:
+            logger.warning("Skipping signal because price or ATR is invalid.")
+            return False
+
         if not self.use_alpaca or not self.trading_client:
-            logger.info(f"[DRY-RUN] Signal: {signal} @ Price: ${current_price:.2f}")
-            return
+            logger.info(f"[DRY-RUN] Signal: {signal} @ ${current_price:.2f}, ATR: ${atr:.2f}")
+            return True
 
         try:
+            clock = self.trading_client.get_clock()
+            if not clock.is_open:
+                logger.info("Market is closed. Skipping order submission.")
+                return False
+            bar_closed_at = pd.Timestamp(df.index[-1]) + pd.Timedelta(minutes=self.bar_minutes)
+            clock_time = pd.Timestamp(clock.timestamp)
+            if clock_time.tzinfo is None:
+                clock_time = clock_time.tz_localize("UTC")
+            if clock_time - bar_closed_at > pd.Timedelta(minutes=30):
+                logger.warning("Latest completed bar is stale; skipping order submission.")
+                return False
+
+            positions = self.trading_client.get_all_positions()
+            position = next(
+                (position for position in positions if position.symbol == self.symbol),
+                None,
+            )
+            if position:
+                position_side = str(position.side).split(".")[-1].lower()
+                is_counter_signal = (
+                    (signal == "BUY" and position_side == "short")
+                    or (signal == "SELL" and position_side == "long")
+                )
+                if not is_counter_signal:
+                    logger.info("Already in a %s position; skipping duplicate signal.", position_side)
+                    return False
+                logger.info("Counter-signal detected; closing %s before reversal.", position_side)
+                if not self._close_position_for_reversal():
+                    return False
+
+            open_orders = self._open_symbol_orders()
+            if open_orders:
+                logger.warning(
+                    "Open %s order(s) remain for %s; skipping new entry.",
+                    len(open_orders),
+                    self.symbol,
+                )
+                return False
+
+            remaining_positions = self.trading_client.get_all_positions()
+            if any(position.symbol == self.symbol for position in remaining_positions):
+                logger.error(
+                    "A %s position remains open; refusing to submit the counter-position.",
+                    self.symbol,
+                )
+                return False
+
             account = self.trading_client.get_account()
             equity = float(account.equity)
-            
-            positions = self.trading_client.get_all_positions()
-            position = next((pos for pos in positions if pos.symbol == self.symbol), None)
-            pos_side = str(getattr(position, 'side', '')).lower() if position else None
-            
+            buying_power = float(account.buying_power)
             if signal == 'BUY':
-                if position and pos_side == 'long':
-                    logger.info("Already long. Skipping BUY.")
-                    return
-                if position and pos_side == 'short':
-                    qty_to_cover = float(position.qty)
-                    logger.info(f"Covering short {qty_to_cover} {self.symbol} to flip long.")
-                    cover_req = trading_requests.MarketOrderRequest(
-                        symbol=self.symbol,
-                        qty=qty_to_cover,
-                        side=trading_enums.OrderSide.BUY,
-                        time_in_force=trading_enums.TimeInForce.DAY
-                    )
-                    self.trading_client.submit_order(cover_req)
-                qty = self._calculate_position_size(equity, current_price)
-                if qty == 0:
-                    logger.warning("Insufficient equity or invalid price for position sizing.")
-                    return
-                logger.info(f"Executing BUY {qty} {self.symbol} @ ${current_price:.2f}")
-                order_request = trading_requests.MarketOrderRequest(
-                    symbol=self.symbol,
-                    qty=qty,
-                    side=trading_enums.OrderSide.BUY,
-                    time_in_force=trading_enums.TimeInForce.DAY
-                )
-                order = self.trading_client.submit_order(order_request)
-                logger.info(f"Order Submitted: ID {order.id}")
-                return
-                
+                side = trading_enums.OrderSide.BUY
+                stop_price = math.floor((current_price - stop_distance) * 100) / 100
+                take_profit_price = math.ceil((current_price + target_distance) * 100) / 100
             elif signal == 'SELL':
-                if position and pos_side == 'short':
-                    logger.info("Already short. Skipping SELL.")
-                    return
-                if position and pos_side == 'long':
-                    qty_to_sell = float(position.qty)
-                    logger.info(f"Closing long {qty_to_sell} {self.symbol} to flip short.")
-                    close_req = trading_requests.MarketOrderRequest(
-                        symbol=self.symbol,
-                        qty=qty_to_sell,
-                        side=trading_enums.OrderSide.SELL,
-                        time_in_force=trading_enums.TimeInForce.DAY
-                    )
-                    self.trading_client.submit_order(close_req)
-                qty = self._calculate_position_size(equity, current_price)
-                if qty == 0:
-                    logger.warning("Insufficient equity or invalid price for position sizing.")
-                    return
-                logger.info(f"Executing SHORT {qty} {self.symbol} @ ${current_price:.2f}")
-                order_request = trading_requests.MarketOrderRequest(
-                    symbol=self.symbol,
-                    qty=qty,
-                    side=trading_enums.OrderSide.SELL,
-                    time_in_force=trading_enums.TimeInForce.DAY
-                )
-                order = self.trading_client.submit_order(order_request)
-                logger.info(f"Order Submitted: ID {order.id}")
-                return
+                side = trading_enums.OrderSide.SELL
+                stop_price = math.ceil((current_price + stop_distance) * 100) / 100
+                take_profit_price = math.floor((current_price - target_distance) * 100) / 100
+            else:
+                return False
+
+            if stop_price <= 0 or take_profit_price <= 0:
+                logger.warning("Calculated bracket prices are invalid; skipping order.")
+                return False
+            actual_stop_distance = abs(current_price - stop_price)
+            qty = self._calculate_position_size(
+                equity, current_price, actual_stop_distance, buying_power
+            )
+            if qty < 1:
+                logger.warning("Risk or buying-power limit allows less than one share; skipping.")
+                return False
+
+            bar_id = str(signal_bar_time or df.index[-1])
+            digest = hashlib.sha256(
+                f"{self.symbol}:{signal}:{bar_id}".encode("utf-8")
+            ).hexdigest()[:24]
+            order_request = trading_requests.MarketOrderRequest(
+                symbol=self.symbol,
+                qty=qty,
+                side=side,
+                type=trading_enums.OrderType.MARKET,
+                time_in_force=trading_enums.TimeInForce.GTC,
+                order_class=trading_enums.OrderClass.BRACKET,
+                take_profit=trading_requests.TakeProfitRequest(
+                    limit_price=take_profit_price
+                ),
+                stop_loss=trading_requests.StopLossRequest(stop_price=stop_price),
+                client_order_id=f"ema-rsi-{digest}",
+            )
+            order = self.trading_client.submit_order(order_request)
+            logger.info(
+                "Submitted %s bracket: qty=%s %s, entry~$%.2f, stop=$%.2f, target=$%.2f, order=%s",
+                signal,
+                qty,
+                self.symbol,
+                current_price,
+                stop_price,
+                take_profit_price,
+                order.id,
+            )
+            return True
         except Exception as e:
             logger.error(f"Trade execution failed: {e}", exc_info=True)
+            return False
 
     def run(self, loop=True, interval=60):
-        """
-        Main loop. Fetches data, calculates indicators, generates signal, and executes.
-        """
         logger.info(f"Starting Gold Trader for {self.symbol}...")
-        regime_state = _load_regime_state()
-        last_regime = regime_state.get(self.symbol)
-        
+        strategy_state = _load_strategy_state()
+        last_processed = strategy_state.get(self.symbol)
+
         while loop:
             try:
                 if not _get_bot_state():
@@ -294,39 +431,36 @@ class GoldTrader:
                     time.sleep(10)
                     continue
                 logger.info("Fetching data...")
-                df = self._get_data(limit=200)
-                
+                df = self._get_closed_bars(self._get_data(limit=1000))
                 if df.empty:
-                    logger.warning("No data received. Retrying in 30s.")
+                    logger.warning("No completed 15-minute bars received. Retrying.")
                     time.sleep(30)
                     continue
 
-                logger.info(f"Data received. Last Price: ${df.iloc[-1]['Close']:.2f}")
-                
                 df = self._calculate_indicators(df)
-                if len(df) >= self.slow_ma + 1 and not pd.isna(df.iloc[-1]['SMA_Fast']) and not pd.isna(df.iloc[-1]['SMA_Slow']):
-                    fast = df.iloc[-1]['SMA_Fast']
-                    slow = df.iloc[-1]['SMA_Slow']
-                    current_regime = 'bull' if fast > slow else ('bear' if fast < slow else last_regime)
-                    if last_regime and current_regime and current_regime != last_regime:
-                        logger.info(f"Regime change detected: {last_regime} -> {current_regime}. Checking for trade action.")
-                        rsi = df.iloc[-1]['RSI'] if not pd.isna(df.iloc[-1]['RSI']) else 50
-                        if current_regime == 'bear' and rsi > self.rsi_oversold:
-                            logger.info("Acting on regime change -> SELL")
-                            self._execute_trade('SELL', df)
-                        elif current_regime == 'bull' and rsi < self.rsi_overbought:
-                            logger.info("Acting on regime change -> BUY")
-                            self._execute_trade('BUY', df)
-                    last_regime = current_regime
-                    regime_state[self.symbol] = last_regime
-                    _save_regime_state(regime_state)
-                signal = self._generate_signal(df)
-                self._execute_trade(signal, df)
-                
+                latest_bar = df.index[-1].isoformat()
+                if last_processed is None:
+                    logger.info("Initializing at latest closed bar; waiting for the next bar before trading.")
+                    last_processed = latest_bar
+                    strategy_state[self.symbol] = latest_bar
+                    _save_strategy_state(strategy_state)
+                elif latest_bar != last_processed:
+                    logger.info(
+                        "Latest closed 15-minute bar: %s, close=$%.2f",
+                        latest_bar,
+                        float(df.iloc[-1]['Close']),
+                    )
+                    signal = self._generate_signal(df)
+                    if signal in ('BUY', 'SELL'):
+                        self._execute_trade(signal, df, latest_bar)
+                    last_processed = latest_bar
+                    strategy_state[self.symbol] = latest_bar
+                    _save_strategy_state(strategy_state)
+
                 if not loop:
                     break
-                    
-                logger.info(f"Waiting {interval} seconds for next candle...")
+
+                logger.info(f"Waiting {interval} seconds for the next data check...")
                 time.sleep(interval)
                 
             except KeyboardInterrupt:

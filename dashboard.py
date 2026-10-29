@@ -192,27 +192,29 @@ try:
 except Exception as e:
     st.warning(f"Could not load orders: {e}")
 
-# SMA/RSI Status
-st.subheader("Technical Indicators (SMA 12/26 + RSI 14)")
+# EMA/RSI Status
+st.subheader("Technical Indicators (EMA 50/200 + RSI/ATR 14)")
 try:
     trader = GoldTrader(paper=True, symbol=SYMBOL)
-    df = trader._get_data(limit=200)
+    df = trader._closed_bars(trader._get_data(limit=1000))
     if not df.empty:
-        df_ind = trader._calculate_indicators(df.copy())
+        df_ind = trader._calculate_indicators(df)
         if len(df_ind) > 0:
             last = df_ind.iloc[-1]
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Close", f"${float(last['Close']):.2f}")
-            c2.metric("SMA Fast (12)", f"${float(last['SMA_Fast']):.2f}" if pd.notna(last.get('SMA_Fast')) else "N/A")
-            c3.metric("SMA Slow (26)", f"${float(last['SMA_Slow']):.2f}" if pd.notna(last.get('SMA_Slow')) else "N/A")
+            c2.metric("EMA 50", f"${float(last['EMA_Fast']):.2f}" if pd.notna(last.get('EMA_Fast')) else "N/A")
+            c3.metric("EMA 200", f"${float(last['EMA_Slow']):.2f}" if pd.notna(last.get('EMA_Slow')) else "N/A")
             c4.metric("RSI (14)", f"{float(last['RSI']):.2f}" if pd.notna(last.get('RSI')) else "N/A")
-            if pd.notna(last.get('SMA_Fast')) and pd.notna(last.get('SMA_Slow')):
-                if last['SMA_Fast'] > last['SMA_Slow']:
-                    st.info("SMA Fast > SMA Slow (Bullish)")
-                elif last['SMA_Fast'] < last['SMA_Slow']:
-                    st.info("SMA Fast < SMA Slow (Bearish)")
+            c5.metric("ATR (14)", f"${float(last['ATR']):.2f}" if pd.notna(last.get('ATR')) else "N/A")
+            st.caption(f"Data: {trader.last_data_source} · Completed bar: {df_ind.index[-1]}")
+            if pd.notna(last.get('EMA_Fast')) and pd.notna(last.get('EMA_Slow')):
+                if last['EMA_Fast'] > last['EMA_Slow']:
+                    st.info("EMA 50 > EMA 200 (Bullish)")
+                elif last['EMA_Fast'] < last['EMA_Slow']:
+                    st.info("EMA 50 < EMA 200 (Bearish)")
                 else:
-                    st.info("SMA Fast == SMA Slow")
+                    st.info("EMA 50 == EMA 200")
         else:
             st.info("Not enough data to calculate indicators.")
     else:
@@ -233,12 +235,13 @@ else:
 # Bot Info
 st.subheader("Bot Configuration")
 st.json({
-    "Strategy": "SMA Crossover (12/26) + RSI (14)",
-    "Timeframe": "15 min (yfinance fallback)",
+    "Strategy": "EMA (50/200) trend + RSI (14) pullback",
+    "Entry": "RSI crosses above 40 in bull trend; below 60 in bear trend",
+    "Timeframe": "15-minute completed bars",
     "Symbol": SYMBOL,
-    "Position Size": "10% of equity",
-    "Stop Loss": "2% (disabled for fractional)",
-    "Take Profit": "4% (disabled for fractional)",
+    "Position Size": "1% equity risk per trade, limited by buying power",
+    "Stop Loss": "1.5 x ATR (14)",
+    "Take Profit": "3 x ATR (14)",
     "Mode": "Paper Trading" if connected else "Demo",
     "Deployment": "Single Web Service (in-thread)"
 })

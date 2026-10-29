@@ -2,6 +2,7 @@
 .env
 __pycache__/
 *.pyc
+strategy_state.json
 st.log
 st.err
 pip_st.log
