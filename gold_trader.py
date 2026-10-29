@@ -258,11 +258,48 @@ class GoldTrader:
             )
         )
 
-    def _close_position_for_reversal(self):
-        open_orders = self._open_symbol_orders()
+    def close_active_order(self, symbol=None):
+        """Cancel any currently open order for the symbol and return the cancelled IDs."""
+        symbol = self.symbol if symbol is None else symbol
+        return self.close_active_orders(symbol)
+
+    def close_active_orders(self, symbol=None):
+        symbol = self.symbol if symbol is None else symbol
+        if not self.use_alpaca or not self.trading_client:
+            logger.info("No Alpaca client available; cannot close %s orders.", symbol)
+            return []
+
+        try:
+            open_orders = self.trading_client.get_orders(
+                filter=trading_requests.GetOrdersRequest(
+                    status=trading_enums.QueryOrderStatus.OPEN,
+                    limit=100,
+                    symbols=[symbol],
+                )
+            )
+        except Exception as exc:
+            logger.error("Failed to fetch open %s orders before closing: %s", symbol, exc)
+            return []
+
+        cancelled = []
         for order in open_orders:
-            logger.info("Canceling open %s order %s before reversing.", self.symbol, order.id)
-            self.trading_client.cancel_order_by_id(order.id)
+            order_id = getattr(order, "id", None)
+            if order_id is None:
+                continue
+            try:
+                logger.info("Canceling open %s order %s before closing.", symbol, order_id)
+                self.trading_client.cancel_order_by_id(order_id)
+                cancelled.append(order_id)
+            except Exception as exc:
+                logger.warning("Could not cancel open %s order %s: %s", symbol, order_id, exc)
+        return cancelled
+
+    def _close_position_for_reversal(self):
+        cancelled_ids = self.close_active_orders()
+        if cancelled_ids:
+            logger.info("Cancelled active %s order IDs before reversing: %s", self.symbol, cancelled_ids)
+
+        open_orders = self._open_symbol_orders()
 
         cancel_deadline = time.monotonic() + 30
         while self._open_symbol_orders():
