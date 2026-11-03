@@ -12,6 +12,7 @@ import os
 import json
 import math
 import hashlib
+import threading
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -20,6 +21,9 @@ from bot_state import _get_bot_state
 
 load_dotenv()
 
+DEFAULT_TRADING_SYMBOLS = ("GLD", "BTC/USD")
+
+
 def normalize_trading_symbol(symbol):
     normalized = str(symbol).strip().upper()
     if normalized in {"BTC/USD", "BTCUSD", "BTC-USD"}:
@@ -27,11 +31,25 @@ def normalize_trading_symbol(symbol):
     return normalized
 
 
+def get_trading_symbols():
+    configured_symbols = os.getenv("TRADING_SYMBOLS")
+    if configured_symbols is None:
+        configured_symbols = os.getenv("TRADING_SYMBOL")
+        if configured_symbols is None:
+            return list(DEFAULT_TRADING_SYMBOLS)
+
+    symbols = [normalize_trading_symbol(symbol) for symbol in configured_symbols.split(",")]
+    if not symbols or any(not symbol for symbol in symbols):
+        raise ValueError("TRADING_SYMBOLS must contain one or more comma-separated symbols.")
+    return list(dict.fromkeys(symbols))
+
+
 def is_crypto_symbol(symbol):
     return normalize_trading_symbol(symbol) == "BTC/USD"
 
 
 STRATEGY_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_state.json")
+_STRATEGY_STATE_LOCK = threading.Lock()
 
 def _load_strategy_state():
     try:
@@ -47,18 +65,32 @@ def _save_strategy_state(state):
     with open(STRATEGY_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
+
+def _save_strategy_state_for_symbol(symbol, latest_bar):
+    with _STRATEGY_STATE_LOCK:
+        state = _load_strategy_state()
+        state[symbol] = latest_bar
+        _save_strategy_state(state)
+
+
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class GoldTrader:
-    def __init__(self, api_key=None, api_secret=None, paper=True, symbol="GLD"):
+    def __init__(
+        self, api_key=None, api_secret=None, paper=True, symbol="GLD",
+        allocation_fraction=1.0,
+    ):
         """
         Initialize the trader.
         If API keys are not provided, it defaults to a 'dry-run' mode using 
         synthetic data or yfinance for historical analysis.
         """
         self.symbol = normalize_trading_symbol(symbol)
+        if not 0 < allocation_fraction <= 1:
+            raise ValueError("allocation_fraction must be greater than 0 and at most 1.")
+        self.allocation_fraction = allocation_fraction
         self.is_crypto = is_crypto_symbol(self.symbol)
         if self.is_crypto:
             logger.warning(
@@ -300,7 +332,9 @@ class GoldTrader:
             return 0
         risk_amount = equity * self.risk_pct
         risk_limited_qty = math.floor(risk_amount / stop_distance)
-        buying_power_limited_qty = math.floor(buying_power / price)
+        buying_power_limited_qty = math.floor(
+            buying_power * self.allocation_fraction / price
+        )
         return max(0, min(risk_limited_qty, buying_power_limited_qty))
 
     def _calculate_crypto_position_size(
@@ -313,7 +347,8 @@ class GoldTrader:
             raise ValueError("Crypto quantity increments must be positive.")
 
         risk_amount = equity * self.risk_pct
-        raw_qty = min(risk_amount / stop_distance, buying_power / price)
+        allocated_buying_power = buying_power * self.allocation_fraction
+        raw_qty = min(risk_amount / stop_distance, allocated_buying_power / price)
         increment = Decimal(str(min_trade_increment))
         qty = (
             Decimal(str(raw_qty)) / increment
@@ -634,7 +669,7 @@ class GoldTrader:
                     logger.info("Initializing at latest closed bar; waiting for the next bar before trading.")
                     last_processed = latest_bar
                     strategy_state[self.symbol] = latest_bar
-                    _save_strategy_state(strategy_state)
+                    _save_strategy_state_for_symbol(self.symbol, latest_bar)
                 elif latest_bar != last_processed:
                     logger.info(
                         "Latest closed 15-minute bar: %s, close=$%.2f",
@@ -645,8 +680,7 @@ class GoldTrader:
                     if signal in ('BUY', 'SELL'):
                         self._execute_trade(signal, df, latest_bar)
                     last_processed = latest_bar
-                    strategy_state[self.symbol] = latest_bar
-                    _save_strategy_state(strategy_state)
+                    _save_strategy_state_for_symbol(self.symbol, latest_bar)
 
                 if not loop:
                     break
@@ -662,5 +696,29 @@ class GoldTrader:
                 time.sleep(10)
 
 if __name__ == "__main__":
-    trader = GoldTrader(paper=True, symbol=os.getenv("TRADING_SYMBOL", "GLD"))
-    trader.run(loop=True, interval=60)
+    symbols = get_trading_symbols()
+    allocation_fraction = 1 / len(symbols)
+    traders = [
+        GoldTrader(
+            paper=True,
+            symbol=symbol,
+            allocation_fraction=allocation_fraction,
+        )
+        for symbol in symbols
+    ]
+    if len(traders) == 1:
+        traders[0].run(loop=True, interval=60)
+    else:
+        threads = [
+            threading.Thread(
+                target=trader.run,
+                kwargs={"loop": True, "interval": 60},
+                name=f"trader-{trader.symbol.replace('/', '-')}",
+                daemon=True,
+            )
+            for trader in traders
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()

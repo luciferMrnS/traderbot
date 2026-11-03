@@ -6,7 +6,6 @@ inspects the paper account (clock, positions, orders).
 It does NOT submit any orders.
 """
 import logging
-import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -14,11 +13,15 @@ import pandas as pd
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 
-from gold_trader import GoldTrader, STRATEGY_STATE_FILE
+from gold_trader import GoldTrader, STRATEGY_STATE_FILE, get_trading_symbols
 
 
-def main():
-    t = GoldTrader(paper=True, symbol=os.getenv("TRADING_SYMBOL", "GLD"))
+def diagnose_symbol(symbol, allocation_fraction):
+    t = GoldTrader(
+        paper=True,
+        symbol=symbol,
+        allocation_fraction=allocation_fraction,
+    )
 
     print("\n=== 1. DATA PIPELINE (exactly as the bot sees it) ===")
     print(
@@ -113,4 +116,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    symbols = get_trading_symbols()
+    allocation_fraction = 1 / len(symbols)
+    for symbol in symbols:
+        print(f"\n\n######## {symbol} ########")
+        diagnose_symbol(symbol, allocation_fraction)

@@ -14,19 +14,20 @@ import threading
 import time
 from dotenv import load_dotenv
 
-from gold_trader import GoldTrader, is_crypto_symbol, normalize_trading_symbol
+from gold_trader import GoldTrader, get_trading_symbols, is_crypto_symbol
 from bot_state import get_bot_state, set_bot_state
 
 load_dotenv()
 
-SYMBOL = normalize_trading_symbol(os.getenv("TRADING_SYMBOL", "GLD"))
-IS_CRYPTO = is_crypto_symbol(SYMBOL)
+SYMBOLS = get_trading_symbols()
+ALLOCATION_FRACTION = 1 / len(SYMBOLS)
+HAS_CRYPTO = any(is_crypto_symbol(symbol) for symbol in SYMBOLS)
 
 # Page Config
 st.set_page_config(
-    page_title=f"{SYMBOL} Trading Dashboard",
+    page_title=f"{', '.join(SYMBOLS)} Trading Dashboard",
     layout="wide",
-    page_icon="₿" if IS_CRYPTO else "🥇",
+    page_icon="₿" if len(SYMBOLS) == 1 and HAS_CRYPTO else "📈",
 )
 
 st.markdown(
@@ -193,22 +194,35 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Start the trading bot in a background thread (single web service deployment)
+# Start one strategy worker per configured symbol.
 @st.cache_resource
-def start_bot_thread():
-    def run_bot():
+def start_bot_threads():
+    def run_bot(symbol):
         try:
-            trader = GoldTrader(paper=True, symbol=SYMBOL)
+            trader = GoldTrader(
+                paper=True,
+                symbol=symbol,
+                allocation_fraction=ALLOCATION_FRACTION,
+            )
             trader.run(loop=True, interval=60)
         except Exception as e:
-            print(f"Bot thread error: {e}")
-    
-    thread = threading.Thread(target=run_bot, daemon=True)
-    thread.start()
-    return thread
+            print(f"Bot thread error for {symbol}: {e}")
+
+    threads = [
+        threading.Thread(
+            target=run_bot,
+            args=(symbol,),
+            name=f"trader-{symbol.replace('/', '-')}",
+            daemon=True,
+        )
+        for symbol in SYMBOLS
+    ]
+    for thread in threads:
+        thread.start()
+    return threads
 
 # Initialize bot thread on app startup
-start_bot_thread()
+start_bot_threads()
 
 # --- Config ---
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -221,17 +235,17 @@ data_cli = None
 crypto_data_cli = None
 try:
     trading_cli = trading_client.TradingClient(API_KEY, API_SECRET, paper=True)
-    try:
-        if IS_CRYPTO:
+    if HAS_CRYPTO:
+        try:
             from alpaca.data.historical import CryptoHistoricalDataClient
             crypto_data_cli = CryptoHistoricalDataClient(API_KEY, API_SECRET)
-        else:
+        except Exception as e:
+            st.sidebar.warning(f"Crypto data unavailable; Yahoo Finance fallback will be used: {e}")
+    if any(not is_crypto_symbol(symbol) for symbol in SYMBOLS):
+        try:
             data_cli = data_module.StockHistoricalDataClient(API_KEY, API_SECRET)
-    except Exception:
-        if IS_CRYPTO:
-            crypto_data_cli = None
-        else:
-            data_cli = None
+        except Exception as e:
+            st.sidebar.warning(f"Stock data unavailable; Yahoo Finance fallback will be used: {e}")
     account = trading_cli.get_account()
     connected = True
 except Exception as e:
@@ -263,18 +277,18 @@ def get_recent_orders(limit=10):
     except:
         return []
 
-def get_price_data():
+def get_price_data(symbol):
     # Try Alpaca first
-    if connected and IS_CRYPTO and crypto_data_cli:
+    if connected and is_crypto_symbol(symbol) and crypto_data_cli:
         try:
             request = CryptoBarsRequest(
-                symbol_or_symbols=[SYMBOL],
+                symbol_or_symbols=[symbol],
                 timeframe=TimeFrame(15, TimeFrameUnit.Minute),
                 start=datetime.utcnow() - timedelta(days=1),
                 end=datetime.utcnow()
             )
             response = crypto_data_cli.get_crypto_bars(request)
-            bars = response.data.get(SYMBOL, [])
+            bars = response.data.get(symbol, [])
             if bars:
                 df = pd.DataFrame(
                     [bar.model_dump(exclude={"symbol"}) for bar in bars]
@@ -285,17 +299,17 @@ def get_price_data():
         except Exception:
             pass
 
-    if connected and data_cli:
+    if connected and not is_crypto_symbol(symbol) and data_cli:
         try:
             request = StockBarsRequest(
-                symbol_or_symbols=[SYMBOL],
+                symbol_or_symbols=[symbol],
                 timeframe=TimeFrame.Minute,
                 start=datetime.utcnow() - timedelta(days=1),
                 end=datetime.utcnow()
             )
             response = data_cli.get_stock_bars(request)
-            if SYMBOL in response.data:
-                df = response.data[SYMBOL]
+            if symbol in response.data:
+                df = response.data[symbol]
                 df.index = pd.to_datetime(df.index)
                 return df
         except Exception:
@@ -303,7 +317,7 @@ def get_price_data():
     
     # Fallback to yfinance
     try:
-        ticker = "BTC-USD" if IS_CRYPTO else SYMBOL
+        ticker = "BTC-USD" if is_crypto_symbol(symbol) else symbol
         df = yf.download(ticker, period="1d", interval="15m", progress=False)
         if df.empty:
             return pd.DataFrame()
@@ -321,9 +335,9 @@ st.markdown(
     f"""
     <div class="hero">
       <div>
-        <div class="hero-kicker">{"Crypto" if IS_CRYPTO else "Precious metals"} · automated strategy</div>
-        <div class="hero-title">{SYMBOL} Trading Desk</div>
-        <div class="hero-copy">{SYMBOL} · EMA 50/200 trend · RSI pullback · 15-minute bars</div>
+        <div class="hero-kicker">Multi-asset · automated strategy</div>
+        <div class="hero-title">{", ".join(SYMBOLS)} Trading Desk</div>
+        <div class="hero-copy">EMA 50/200 trend · RSI pullback · 15-minute bars per asset</div>
       </div>
       <div class="hero-right">
         <div class="status-pill {connection_class}">
@@ -431,7 +445,9 @@ except Exception as e:
 # EMA/RSI Status
 st.markdown("---")
 st.subheader("Technical Indicators (EMA 50/200 + RSI/ATR 14)")
-if IS_CRYPTO:
+selected_symbol = st.selectbox("Market", SYMBOLS, key="market_selector")
+selected_is_crypto = is_crypto_symbol(selected_symbol)
+if selected_is_crypto:
     st.warning(
         "BTC/USD orders have no broker-side stop-loss or take-profit. "
         "BTC/USD spot trading is long-only; the bot exits with a market order "
@@ -439,7 +455,11 @@ if IS_CRYPTO:
         "sizing estimate while the bot waits for a signal or is offline."
     )
 try:
-    trader = GoldTrader(paper=True, symbol=SYMBOL)
+    trader = GoldTrader(
+        paper=True,
+        symbol=selected_symbol,
+        allocation_fraction=ALLOCATION_FRACTION,
+    )
     df = trader._closed_bars(trader._get_data(limit=1000))
     if not df.empty:
         df_ind = trader._calculate_indicators(df)
@@ -468,8 +488,8 @@ except Exception as e:
 
 # Price Chart
 st.markdown("---")
-st.subheader(f"Live Price ({SYMBOL}) - Last 24h")
-price_df = get_price_data()
+st.subheader(f"Live Price ({selected_symbol}) - Last 24h")
+price_df = get_price_data(selected_symbol)
 if not price_df.empty and 'Close' in price_df.columns:
     st.line_chart(price_df['Close'])
 elif not price_df.empty and 'close' in price_df.columns:
@@ -484,26 +504,28 @@ bot_configuration = {
     "Strategy": "EMA (50/200) trend + RSI (14) pullback",
     "Entry": "RSI crosses above 40 in bull trend; below 60 in bear trend",
     "Timeframe": "15-minute completed bars",
-    "Symbol": SYMBOL,
+    "Symbols": ", ".join(SYMBOLS),
     "Position Size": (
-        "Sized against a 1.5 x ATR reference, limited by crypto buying power; "
-        "actual loss may exceed 1% without a protective stop"
-        if IS_CRYPTO else "1% equity risk per trade, limited by buying power"
+        "1% equity risk target per asset; buying power is split evenly between configured assets. "
+        "BTC/USD losses can exceed the estimate "
+        "because it has no broker-side stop"
     ),
+    "Buying Power Cap": f"Up to {100 * ALLOCATION_FRACTION:.2f}% per symbol",
     "Mode": "Paper Trading" if connected else "Demo",
-    "Deployment": "Single Web Service (in-thread)"
+    "Deployment": f"Single Web Service ({len(SYMBOLS)} in-process strategy workers)"
 }
-if IS_CRYPTO:
-    bot_configuration["Exit"] = (
-        "Long-only; market close on opposing signal; "
-        "no broker-side stop-loss/take-profit"
+bot_configuration["Exits"] = (
+    "BTC/USD: long-only, market close on opposing signal, no broker stop/target; "
+    "other symbols: 1.5 x ATR stop and 3 x ATR target"
+    if HAS_CRYPTO and any(not is_crypto_symbol(symbol) for symbol in SYMBOLS)
+    else (
+        "Long-only, market close on opposing signal, no broker stop/target"
+        if HAS_CRYPTO else "1.5 x ATR stop and 3 x ATR target"
     )
-else:
-    bot_configuration["Stop Loss"] = "1.5 x ATR (14)"
-    bot_configuration["Take Profit"] = "3 x ATR (14)"
+)
 st.json(bot_configuration)
-st.caption("Set TRADING_SYMBOL=BTC/USD to run BTC/USD; it defaults to GLD.")
-st.caption("Bot runs in background thread alongside dashboard. Toggle 'Bot Running' in sidebar to pause/resume.")
+st.caption("Set TRADING_SYMBOLS=GLD,BTC/USD to trade both. TRADING_SYMBOL remains available for a single-symbol run.")
+st.caption("The dashboard starts one background strategy worker per symbol. Toggle 'Bot Running' to pause/resume all workers.")
 
 # Auto-Refresh Logic
 if auto_refresh and connected:
