@@ -1,11 +1,12 @@
 """
-Read-only diagnostic for the GLD trading bot.
+Read-only diagnostic for the configured trading bot.
 
 Replicates the bot's exact data -> indicators -> signal pipeline and
 inspects the paper account (clock, positions, orders).
 It does NOT submit any orders.
 """
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -17,10 +18,13 @@ from gold_trader import GoldTrader, STRATEGY_STATE_FILE
 
 
 def main():
-    t = GoldTrader(paper=True, symbol="GLD")
+    t = GoldTrader(paper=True, symbol=os.getenv("TRADING_SYMBOL", "GLD"))
 
     print("\n=== 1. DATA PIPELINE (exactly as the bot sees it) ===")
-    print(f"Alpaca connected={t.use_alpaca}  data_client={t.data_client is not None}")
+    print(
+        f"symbol={t.symbol}  Alpaca connected={t.use_alpaca}  "
+        f"data_client={(t.crypto_data_client if t.is_crypto else t.data_client) is not None}"
+    )
     df = t._closed_bars(t._get_data(limit=1000))
     if df.empty:
         print("!! No completed 15-minute bars received")
@@ -53,19 +57,29 @@ def main():
     sig = t._generate_signal(ind)
     print(f"entry signal: {sig!r}")
     print("BUY: EMA50 > EMA200 and RSI crosses above 40; SELL: EMA50 < EMA200 and RSI crosses below 60")
-    print("Stop: 1.5 x ATR(14); target: 3 x ATR(14); risk budget: 1% of equity")
+    if t.is_crypto:
+        print(
+            "Exit: long-only; market close on opposing signal; "
+            "no broker-side stop/target; 1% sizing is only an ATR reference, "
+            "so realized losses can be larger"
+        )
+    else:
+        print("Stop: 1.5 x ATR(14); target: 3 x ATR(14); risk budget: 1% of equity")
 
     if not t.use_alpaca or not t.trading_client:
         print("\n(not connected to Alpaca; skipping account section)")
         return
 
     print("\n=== 4. ACCOUNT / MARKET STATE (read-only) ===")
-    try:
-        clock = t.trading_client.get_clock()
-        print(f"market open: {clock.is_open}   now: {clock.timestamp}")
-        print(f"next open: {clock.next_open}   next close: {clock.next_close}")
-    except Exception as e:
-        print(f"clock failed: {e}")
+    if t.is_crypto:
+        print("market: crypto trades 24/7")
+    else:
+        try:
+            clock = t.trading_client.get_clock()
+            print(f"market open: {clock.is_open}   now: {clock.timestamp}")
+            print(f"next open: {clock.next_open}   next close: {clock.next_close}")
+        except Exception as e:
+            print(f"clock failed: {e}")
 
     try:
         acct = t.trading_client.get_account()

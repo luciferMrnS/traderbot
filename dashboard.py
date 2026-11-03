@@ -3,7 +3,8 @@ import pandas as pd
 import alpaca.trading.client as trading_client
 import alpaca.data.historical as data_module
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from datetime import datetime, timedelta
@@ -13,13 +14,20 @@ import threading
 import time
 from dotenv import load_dotenv
 
-from gold_trader import GoldTrader
+from gold_trader import GoldTrader, is_crypto_symbol, normalize_trading_symbol
 from bot_state import get_bot_state, set_bot_state
 
 load_dotenv()
 
+SYMBOL = normalize_trading_symbol(os.getenv("TRADING_SYMBOL", "GLD"))
+IS_CRYPTO = is_crypto_symbol(SYMBOL)
+
 # Page Config
-st.set_page_config(page_title="Gold Trader Dashboard", layout="wide", page_icon="🥇")
+st.set_page_config(
+    page_title=f"{SYMBOL} Trading Dashboard",
+    layout="wide",
+    page_icon="₿" if IS_CRYPTO else "🥇",
+)
 
 st.markdown(
     """
@@ -190,7 +198,7 @@ st.markdown(
 def start_bot_thread():
     def run_bot():
         try:
-            trader = GoldTrader(paper=True, symbol="GLD")
+            trader = GoldTrader(paper=True, symbol=SYMBOL)
             trader.run(loop=True, interval=60)
         except Exception as e:
             print(f"Bot thread error: {e}")
@@ -205,18 +213,25 @@ start_bot_thread()
 # --- Config ---
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_API_SECRET")
-SYMBOL = "GLD"
 
 # Try to connect
 connected = False
 trading_cli = None
 data_cli = None
+crypto_data_cli = None
 try:
     trading_cli = trading_client.TradingClient(API_KEY, API_SECRET, paper=True)
     try:
-        data_cli = data_module.StockHistoricalDataClient(API_KEY, API_SECRET)
+        if IS_CRYPTO:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            crypto_data_cli = CryptoHistoricalDataClient(API_KEY, API_SECRET)
+        else:
+            data_cli = data_module.StockHistoricalDataClient(API_KEY, API_SECRET)
     except Exception:
-        data_cli = None
+        if IS_CRYPTO:
+            crypto_data_cli = None
+        else:
+            data_cli = None
     account = trading_cli.get_account()
     connected = True
 except Exception as e:
@@ -250,6 +265,26 @@ def get_recent_orders(limit=10):
 
 def get_price_data():
     # Try Alpaca first
+    if connected and IS_CRYPTO and crypto_data_cli:
+        try:
+            request = CryptoBarsRequest(
+                symbol_or_symbols=[SYMBOL],
+                timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+                start=datetime.utcnow() - timedelta(days=1),
+                end=datetime.utcnow()
+            )
+            response = crypto_data_cli.get_crypto_bars(request)
+            bars = response.data.get(SYMBOL, [])
+            if bars:
+                df = pd.DataFrame(
+                    [bar.model_dump(exclude={"symbol"}) for bar in bars]
+                ).set_index("timestamp")
+                df.index = pd.to_datetime(df.index)
+                df.columns = [str(column).title() for column in df.columns]
+                return df
+        except Exception:
+            pass
+
     if connected and data_cli:
         try:
             request = StockBarsRequest(
@@ -268,7 +303,8 @@ def get_price_data():
     
     # Fallback to yfinance
     try:
-        df = yf.download(SYMBOL, period="1d", interval="15m", progress=False)
+        ticker = "BTC-USD" if IS_CRYPTO else SYMBOL
+        df = yf.download(ticker, period="1d", interval="15m", progress=False)
         if df.empty:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
@@ -285,9 +321,9 @@ st.markdown(
     f"""
     <div class="hero">
       <div>
-        <div class="hero-kicker">Precious metals · automated strategy</div>
-        <div class="hero-title">Gold Trading Desk</div>
-        <div class="hero-copy">GLD · EMA 50/200 trend · RSI pullback · 15-minute bars</div>
+        <div class="hero-kicker">{"Crypto" if IS_CRYPTO else "Precious metals"} · automated strategy</div>
+        <div class="hero-title">{SYMBOL} Trading Desk</div>
+        <div class="hero-copy">{SYMBOL} · EMA 50/200 trend · RSI pullback · 15-minute bars</div>
       </div>
       <div class="hero-right">
         <div class="status-pill {connection_class}">
@@ -395,6 +431,13 @@ except Exception as e:
 # EMA/RSI Status
 st.markdown("---")
 st.subheader("Technical Indicators (EMA 50/200 + RSI/ATR 14)")
+if IS_CRYPTO:
+    st.warning(
+        "BTC/USD orders have no broker-side stop-loss or take-profit. "
+        "BTC/USD spot trading is long-only; the bot exits with a market order "
+        "when the strategy signals a reversal. Losses can exceed the 1% ATR-based "
+        "sizing estimate while the bot waits for a signal or is offline."
+    )
 try:
     trader = GoldTrader(paper=True, symbol=SYMBOL)
     df = trader._closed_bars(trader._get_data(limit=1000))
@@ -437,17 +480,29 @@ else:
 # Bot Info
 st.markdown("---")
 st.subheader("Bot Configuration")
-st.json({
+bot_configuration = {
     "Strategy": "EMA (50/200) trend + RSI (14) pullback",
     "Entry": "RSI crosses above 40 in bull trend; below 60 in bear trend",
     "Timeframe": "15-minute completed bars",
     "Symbol": SYMBOL,
-    "Position Size": "1% equity risk per trade, limited by buying power",
-    "Stop Loss": "1.5 x ATR (14)",
-    "Take Profit": "3 x ATR (14)",
+    "Position Size": (
+        "Sized against a 1.5 x ATR reference, limited by crypto buying power; "
+        "actual loss may exceed 1% without a protective stop"
+        if IS_CRYPTO else "1% equity risk per trade, limited by buying power"
+    ),
     "Mode": "Paper Trading" if connected else "Demo",
     "Deployment": "Single Web Service (in-thread)"
-})
+}
+if IS_CRYPTO:
+    bot_configuration["Exit"] = (
+        "Long-only; market close on opposing signal; "
+        "no broker-side stop-loss/take-profit"
+    )
+else:
+    bot_configuration["Stop Loss"] = "1.5 x ATR (14)"
+    bot_configuration["Take Profit"] = "3 x ATR (14)"
+st.json(bot_configuration)
+st.caption("Set TRADING_SYMBOL=BTC/USD to run BTC/USD; it defaults to GLD.")
 st.caption("Bot runs in background thread alongside dashboard. Toggle 'Bot Running' in sidebar to pause/resume.")
 
 # Auto-Refresh Logic

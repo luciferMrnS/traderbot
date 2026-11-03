@@ -12,12 +12,24 @@ import os
 import json
 import math
 import hashlib
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 from bot_state import _get_bot_state
 
 load_dotenv()
+
+def normalize_trading_symbol(symbol):
+    normalized = str(symbol).strip().upper()
+    if normalized in {"BTC/USD", "BTCUSD", "BTC-USD"}:
+        return "BTC/USD"
+    return normalized
+
+
+def is_crypto_symbol(symbol):
+    return normalize_trading_symbol(symbol) == "BTC/USD"
+
 
 STRATEGY_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_state.json")
 
@@ -42,11 +54,18 @@ logger = logging.getLogger(__name__)
 class GoldTrader:
     def __init__(self, api_key=None, api_secret=None, paper=True, symbol="GLD"):
         """
-        Initialize the GoldTrader.
+        Initialize the trader.
         If API keys are not provided, it defaults to a 'dry-run' mode using 
         synthetic data or yfinance for historical analysis.
         """
-        self.symbol = symbol
+        self.symbol = normalize_trading_symbol(symbol)
+        self.is_crypto = is_crypto_symbol(self.symbol)
+        if self.is_crypto:
+            logger.warning(
+                "%s is long-only; exits occur on an opposing strategy signal, "
+                "without broker-side stop-loss or take-profit orders.",
+                self.symbol,
+            )
         self.paper = paper
         self.api_key = api_key or os.getenv("ALPACA_API_KEY", "demo_key")
         self.api_secret = api_secret or os.getenv("ALPACA_API_SECRET", "demo_secret")
@@ -58,15 +77,25 @@ class GoldTrader:
                 secret_key=self.api_secret,
                 paper=self.paper
             )
-            # Try to initialize data client
+            self.crypto_data_client = None
             try:
-                import alpaca.data
-                self.data_client = alpaca.data.StockHistoricalDataClient(
-                    api_key=self.api_key,
-                    secret_key=self.api_secret
-                )
-            except Exception:
+                if self.is_crypto:
+                    from alpaca.data.historical import CryptoHistoricalDataClient
+                    self.crypto_data_client = CryptoHistoricalDataClient(
+                        api_key=self.api_key,
+                        secret_key=self.api_secret
+                    )
+                    self.data_client = None
+                else:
+                    import alpaca.data
+                    self.data_client = alpaca.data.StockHistoricalDataClient(
+                        api_key=self.api_key,
+                        secret_key=self.api_secret
+                    )
+            except Exception as e:
+                logger.warning("Alpaca data client initialization failed: %s", e)
                 self.data_client = None
+                self.crypto_data_client = None
             self.use_alpaca = True
             logger.info(f"Connected to Alpaca (Paper: {self.paper})")
         except Exception as e:
@@ -74,6 +103,7 @@ class GoldTrader:
             self.use_alpaca = False
             self.trading_client = None
             self.data_client = None
+            self.crypto_data_client = None
 
         self.last_data_source = "not fetched"
 
@@ -93,7 +123,29 @@ class GoldTrader:
         """
         Fetch enough 15-minute OHLCV bars for the 200-period EMA.
         """
-        if self.use_alpaca and self.data_client:
+        if self.use_alpaca and self.is_crypto and self.crypto_data_client:
+            try:
+                now = datetime.now(timezone.utc)
+                request = adr.CryptoBarsRequest(
+                    symbol_or_symbols=[self.symbol],
+                    timeframe=timeframe.TimeFrame(15, timeframe.TimeFrameUnit.Minute),
+                    start=now - timedelta(days=30),
+                    end=now,
+                    limit=limit,
+                )
+                response = self.crypto_data_client.get_crypto_bars(request)
+                bars = response.data.get(self.symbol, [])
+                if bars:
+                    df = pd.DataFrame(
+                        [bar.model_dump(exclude={"symbol"}) for bar in bars]
+                    ).set_index("timestamp")
+                    df.index = pd.to_datetime(df.index)
+                    df.columns = [str(column).title() for column in df.columns]
+                    self.last_data_source = "Alpaca Crypto"
+                    return df
+            except Exception as e:
+                logger.error(f"Alpaca data fetch failed: {e}")
+        elif self.use_alpaca and self.data_client:
             try:
                 now = datetime.now(timezone.utc)
                 request = adr.StockBarsRequest(
@@ -122,7 +174,9 @@ class GoldTrader:
             import yfinance as yf
             tickers_to_try = []
             s = str(self.symbol)
-            if s.upper() in ['XAUUSD', 'GOLD']:
+            if self.is_crypto:
+                tickers_to_try = ["BTC-USD"]
+            elif s.upper() in ['XAUUSD', 'GOLD']:
                 tickers_to_try = ['GC=F', 'GLD', 'IAU']
             elif s.endswith('=X'):
                 tickers_to_try = [s, 'GC=F']
@@ -249,6 +303,23 @@ class GoldTrader:
         buying_power_limited_qty = math.floor(buying_power / price)
         return max(0, min(risk_limited_qty, buying_power_limited_qty))
 
+    def _calculate_crypto_position_size(
+        self, equity, price, stop_distance, buying_power,
+        min_trade_increment, min_order_size,
+    ):
+        if equity <= 0 or price <= 0 or stop_distance <= 0 or buying_power <= 0:
+            return Decimal("0")
+        if min_trade_increment <= 0 or min_order_size <= 0:
+            raise ValueError("Crypto quantity increments must be positive.")
+
+        risk_amount = equity * self.risk_pct
+        raw_qty = min(risk_amount / stop_distance, buying_power / price)
+        increment = Decimal(str(min_trade_increment))
+        qty = (
+            Decimal(str(raw_qty)) / increment
+        ).to_integral_value(rounding=ROUND_DOWN) * increment
+        return qty if qty >= Decimal(str(min_order_size)) else Decimal("0")
+
     def _open_symbol_orders(self):
         return self.trading_client.get_orders(
             filter=trading_requests.GetOrdersRequest(
@@ -308,7 +379,34 @@ class GoldTrader:
                 return False
             time.sleep(1)
 
-        close_order = self.trading_client.close_position(self.symbol)
+        if self.is_crypto:
+            position = next(
+                (
+                    position for position in self.trading_client.get_all_positions()
+                    if position.symbol == self.symbol
+                ),
+                None,
+            )
+            if position is None:
+                logger.error("No %s position remains to close.", self.symbol)
+                return False
+            position_side = str(position.side).split(".")[-1].lower()
+            close_side = (
+                trading_enums.OrderSide.SELL
+                if position_side == "long"
+                else trading_enums.OrderSide.BUY
+            )
+            close_order = self.trading_client.submit_order(
+                trading_requests.MarketOrderRequest(
+                    symbol=self.symbol,
+                    qty=float(position.qty),
+                    side=close_side,
+                    type=trading_enums.OrderType.MARKET,
+                    time_in_force=trading_enums.TimeInForce.GTC,
+                )
+            )
+        else:
+            close_order = self.trading_client.close_position(self.symbol)
         close_order_id = getattr(close_order, "id", None)
         if close_order_id is None:
             logger.error("Alpaca did not return an order ID for the %s position close.", self.symbol)
@@ -351,12 +449,15 @@ class GoldTrader:
             return True
 
         try:
-            clock = self.trading_client.get_clock()
-            if not clock.is_open:
-                logger.info("Market is closed. Skipping order submission.")
-                return False
+            if self.is_crypto:
+                clock_time = pd.Timestamp.now(tz="UTC")
+            else:
+                clock = self.trading_client.get_clock()
+                if not clock.is_open:
+                    logger.info("Market is closed. Skipping order submission.")
+                    return False
+                clock_time = pd.Timestamp(clock.timestamp)
             bar_closed_at = pd.Timestamp(df.index[-1]) + pd.Timedelta(minutes=self.bar_minutes)
-            clock_time = pd.Timestamp(clock.timestamp)
             if clock_time.tzinfo is None:
                 clock_time = clock_time.tz_localize("UTC")
             if clock_time - bar_closed_at > pd.Timedelta(minutes=30):
@@ -368,6 +469,9 @@ class GoldTrader:
                 (position for position in positions if position.symbol == self.symbol),
                 None,
             )
+            if self.is_crypto and signal == "SELL" and position is None:
+                logger.info("Ignoring SELL signal; Alpaca spot crypto trading is long-only.")
+                return False
             if position:
                 position_side = str(position.side).split(".")[-1].lower()
                 is_counter_signal = (
@@ -377,9 +481,14 @@ class GoldTrader:
                 if not is_counter_signal:
                     logger.info("Already in a %s position; skipping duplicate signal.", position_side)
                     return False
-                logger.info("Counter-signal detected; closing %s before reversal.", position_side)
+                if self.is_crypto:
+                    logger.info("Opposing signal detected; closing the %s crypto position.", position_side)
+                else:
+                    logger.info("Counter-signal detected; closing %s before reversal.", position_side)
                 if not self._close_position_for_reversal():
                     return False
+                if self.is_crypto:
+                    return True
 
             open_orders = self._open_symbol_orders()
             if open_orders:
@@ -400,7 +509,11 @@ class GoldTrader:
 
             account = self.trading_client.get_account()
             equity = float(account.equity)
-            buying_power = float(account.buying_power)
+            buying_power = float(
+                getattr(account, "non_marginable_buying_power", None)
+                if self.is_crypto and getattr(account, "non_marginable_buying_power", None) is not None
+                else account.buying_power
+            )
             if signal == 'BUY':
                 side = trading_enums.OrderSide.BUY
                 stop_price = math.floor((current_price - stop_distance) * 100) / 100
@@ -412,52 +525,93 @@ class GoldTrader:
             else:
                 return False
 
-            if stop_price <= 0 or take_profit_price <= 0:
+            if not self.is_crypto and (stop_price <= 0 or take_profit_price <= 0):
                 logger.warning("Calculated bracket prices are invalid; skipping order.")
                 return False
+
             actual_stop_distance = abs(current_price - stop_price)
-            qty = self._calculate_position_size(
-                equity, current_price, actual_stop_distance, buying_power
-            )
-            if qty < 1:
-                logger.warning("Risk or buying-power limit allows less than one share; skipping.")
-                return False
+            if self.is_crypto:
+                asset = self.trading_client.get_asset(self.symbol.replace("/", ""))
+                asset_data = asset if isinstance(asset, dict) else asset.model_dump()
+                min_trade_increment = asset_data.get("min_trade_increment")
+                min_order_size = asset_data.get("min_order_size")
+                if min_trade_increment is None or min_order_size is None:
+                    logger.error("Alpaca did not provide quantity limits for %s; skipping order.", self.symbol)
+                    return False
+                qty = self._calculate_crypto_position_size(
+                    equity,
+                    current_price,
+                    stop_distance,
+                    buying_power,
+                    float(min_trade_increment),
+                    float(min_order_size),
+                )
+                if qty <= 0:
+                    logger.warning("Risk or buying-power limit is below the minimum %s order size.", self.symbol)
+                    return False
+            else:
+                qty = self._calculate_position_size(
+                    equity, current_price, actual_stop_distance, buying_power
+                )
+                if qty < 1:
+                    logger.warning("Risk or buying-power limit allows less than one share; skipping.")
+                    return False
 
             bar_id = str(signal_bar_time or df.index[-1])
             digest = hashlib.sha256(
                 f"{self.symbol}:{signal}:{bar_id}".encode("utf-8")
             ).hexdigest()[:24]
-            order_request = trading_requests.MarketOrderRequest(
-                symbol=self.symbol,
-                qty=qty,
-                side=side,
-                type=trading_enums.OrderType.MARKET,
-                time_in_force=trading_enums.TimeInForce.GTC,
-                order_class=trading_enums.OrderClass.BRACKET,
-                take_profit=trading_requests.TakeProfitRequest(
-                    limit_price=take_profit_price
-                ),
-                stop_loss=trading_requests.StopLossRequest(stop_price=stop_price),
-                client_order_id=f"ema-rsi-{digest}",
-            )
+            if self.is_crypto:
+                order_request = trading_requests.MarketOrderRequest(
+                    symbol=self.symbol,
+                    qty=float(qty),
+                    side=side,
+                    type=trading_enums.OrderType.MARKET,
+                    time_in_force=trading_enums.TimeInForce.GTC,
+                    client_order_id=f"ema-rsi-{digest}",
+                )
+            else:
+                order_request = trading_requests.MarketOrderRequest(
+                    symbol=self.symbol,
+                    qty=qty,
+                    side=side,
+                    type=trading_enums.OrderType.MARKET,
+                    time_in_force=trading_enums.TimeInForce.GTC,
+                    order_class=trading_enums.OrderClass.BRACKET,
+                    take_profit=trading_requests.TakeProfitRequest(
+                        limit_price=take_profit_price
+                    ),
+                    stop_loss=trading_requests.StopLossRequest(stop_price=stop_price),
+                    client_order_id=f"ema-rsi-{digest}",
+                )
             order = self.trading_client.submit_order(order_request)
-            logger.info(
-                "Submitted %s bracket: qty=%s %s, entry~$%.2f, stop=$%.2f, target=$%.2f, order=%s",
-                signal,
-                qty,
-                self.symbol,
-                current_price,
-                stop_price,
-                take_profit_price,
-                order.id,
-            )
+            if self.is_crypto:
+                logger.info(
+                    "Submitted %s crypto market order: qty=%s %s, entry~$%.2f, order=%s",
+                    signal,
+                    qty,
+                    self.symbol,
+                    current_price,
+                    order.id,
+                )
+            else:
+                logger.info(
+                    "Submitted %s bracket: qty=%s %s, entry~$%.2f, stop=$%.2f, target=$%.2f, order=%s",
+                    signal,
+                    qty,
+                    self.symbol,
+                    current_price,
+                    stop_price,
+                    take_profit_price,
+                    order.id,
+                )
             return True
         except Exception as e:
             logger.error(f"Trade execution failed: {e}", exc_info=True)
             return False
 
     def run(self, loop=True, interval=60):
-        logger.info(f"Starting Gold Trader for {self.symbol}...")
+        logger.info(f"Starting trader for {self.symbol}...")
         strategy_state = _load_strategy_state()
         last_processed = strategy_state.get(self.symbol)
 
@@ -508,5 +662,5 @@ class GoldTrader:
                 time.sleep(10)
 
 if __name__ == "__main__":
-    trader = GoldTrader(paper=True, symbol="GLD")
+    trader = GoldTrader(paper=True, symbol=os.getenv("TRADING_SYMBOL", "GLD"))
     trader.run(loop=True, interval=60)
