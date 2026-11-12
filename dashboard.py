@@ -337,7 +337,7 @@ st.markdown(
       <div>
         <div class="hero-kicker">Multi-asset · automated strategy</div>
         <div class="hero-title">{", ".join(SYMBOLS)} Trading Desk</div>
-        <div class="hero-copy">EMA 50/200 trend · RSI pullback · 15-minute bars per asset</div>
+        <div class="hero-copy">EMA 50/200 trend · RSI thresholds · 15-minute bars per asset</div>
       </div>
       <div class="hero-right">
         <div class="status-pill {connection_class}">
@@ -501,8 +501,8 @@ else:
 st.markdown("---")
 st.subheader("Bot Configuration")
 bot_configuration = {
-    "Strategy": "EMA (50/200) trend + RSI (14) pullback",
-    "Entry": "RSI crosses above 40 in bull trend; below 60 in bear trend",
+    "Strategy": "EMA (50/200) trend + RSI (14) thresholds",
+    "Entry": "RSI above 40 in bull trend; below 60 in bear trend",
     "Timeframe": "15-minute completed bars",
     "Symbols": ", ".join(SYMBOLS),
     "Position Size": (

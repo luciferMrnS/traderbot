@@ -59,7 +59,7 @@ def diagnose_symbol(symbol, allocation_fraction):
         print(f"strategy state: not found ({e})")
     sig = t._generate_signal(ind)
     print(f"entry signal: {sig!r}")
-    print("BUY: EMA50 > EMA200 and RSI crosses above 40; SELL: EMA50 < EMA200 and RSI crosses below 60")
+    print("BUY: EMA50 > EMA200 and RSI > 40; SELL: EMA50 < EMA200 and RSI < 60")
     if t.is_crypto:
         print(
             "Exit: long-only; market close on opposing signal; "

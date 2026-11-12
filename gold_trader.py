@@ -294,17 +294,15 @@ class GoldTrader:
 
         if (
             last_row['EMA_Fast'] > last_row['EMA_Slow']
-            and prev_row['RSI'] <= self.rsi_long_trigger
             and last_row['RSI'] > self.rsi_long_trigger
         ):
-            logger.info("Signal: BUY (bull trend, RSI crossed above 40)")
+            logger.info("Signal: BUY (bull trend, RSI above 40)")
             return 'BUY'
         if (
             last_row['EMA_Fast'] < last_row['EMA_Slow']
-            and prev_row['RSI'] >= self.rsi_short_trigger
             and last_row['RSI'] < self.rsi_short_trigger
         ):
-            logger.info("Signal: SELL (bear trend, RSI crossed below 60)")
+            logger.info("Signal: SELL (bear trend, RSI below 60)")
             return 'SELL'
         return 'HOLD'
 
