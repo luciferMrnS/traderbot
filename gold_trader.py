@@ -161,7 +161,7 @@ class GoldTrader:
                 request = adr.CryptoBarsRequest(
                     symbol_or_symbols=[self.symbol],
                     timeframe=timeframe.TimeFrame(15, timeframe.TimeFrameUnit.Minute),
-                    start=now - timedelta(days=30),
+                    start=now - timedelta(days=10),
                     end=now,
                     limit=limit,
                 )
@@ -655,7 +655,7 @@ class GoldTrader:
                     time.sleep(10)
                     continue
                 logger.info("Fetching data...")
-                df = self._get_closed_bars(self._get_data(limit=1000))
+                df = self._closed_bars(self._get_data(limit=1000))
                 if df.empty:
                     logger.warning("No completed 15-minute bars received. Retrying.")
                     time.sleep(30)
