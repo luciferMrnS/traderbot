@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from gold_trader import GoldTrader, get_trading_symbols, is_crypto_symbol
 from bot_state import get_bot_state, set_bot_state
+from trade_history import build_trades, fetch_orders, open_position_rows, summarize_trades
 
 load_dotenv()
 
@@ -277,6 +278,13 @@ def get_recent_orders(limit=10):
     except:
         return []
 
+def pnl_color(value):
+    if value < 0:
+        return "color: #ff8585; font-weight: 600"
+    if value > 0:
+        return "color: #67d49a; font-weight: 600"
+    return "color: #dce5dd"
+
 def get_price_data(symbol):
     # Try Alpaca first
     if connected and is_crypto_symbol(symbol) and crypto_data_cli:
@@ -394,13 +402,6 @@ if positions:
         })
     positions_df = pd.DataFrame(pos_data)
 
-    def pnl_color(value):
-        if value < 0:
-            return "color: #ff8585; font-weight: 600"
-        if value > 0:
-            return "color: #67d49a; font-weight: 600"
-        return "color: #dce5dd"
-
     styled_positions = positions_df.style.map(
         pnl_color, subset=["Unrealized P&L", "P&L %"]
     ).format({
@@ -413,6 +414,73 @@ if positions:
     st.dataframe(styled_positions, use_container_width=True)
 else:
     st.info("No open positions.")
+
+# Trade P&L
+st.markdown("---")
+st.subheader("Trade P&L")
+closed_trades = []
+history_error = None
+if connected and trading_cli:
+    try:
+        closed_trades = build_trades(fetch_orders(trading_cli))
+    except Exception as e:
+        history_error = e
+
+if history_error is not None:
+    st.warning(f"Could not load trade history: {history_error}")
+
+trade_rows = closed_trades + open_position_rows(positions)
+if trade_rows:
+    trade_summary = summarize_trades(trade_rows)
+    avg_win = trade_summary["avg_win"]
+    avg_loss = trade_summary["avg_loss"]
+    avg_win_label = f"${avg_win:,.2f}" if avg_win is not None else "—"
+    avg_loss_label = f"${avg_loss:,.2f}" if avg_loss is not None else "—"
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Realized P&L", f"${trade_summary['realized_pnl']:+,.2f}")
+    p2.metric("Closed trades", trade_summary["closed_count"])
+    p3.metric(
+        "Win rate",
+        f"{trade_summary['win_rate']:.0f}%"
+        if trade_summary["win_rate"] is not None
+        else "—",
+    )
+    p4.metric("Avg win / loss", f"{avg_win_label} / {avg_loss_label}")
+    trade_data = [
+        {
+            "Symbol": row["symbol"],
+            "Side": row["side"],
+            "Qty": row["qty"],
+            "Entry": row["entry_time"].strftime("%Y-%m-%d %H:%M") if row["entry_time"] else None,
+            "Entry Price": row["entry_price"],
+            "Exit / Mark": row["exit_time"].strftime("%Y-%m-%d %H:%M") if row["exit_time"] else None,
+            "Exit Price": row["exit_price"],
+            "P&L": row["pnl"],
+            "P&L %": row["pnl_pct"],
+            "Status": row["status"],
+        }
+        for row in trade_rows
+    ]
+    trade_display = pd.DataFrame(trade_data)
+    styled_trades = trade_display.style.map(
+        pnl_color, subset=["P&L", "P&L %"]
+    ).format(
+        {
+            "Qty": "{:,.6g}",
+            "Entry Price": "${:,.2f}",
+            "Exit Price": "${:,.2f}",
+            "P&L": "${:+,.2f}",
+            "P&L %": "{:+.2f}%",
+        },
+        na_rep="—",
+    )
+    st.dataframe(styled_trades, use_container_width=True)
+    st.caption(
+        "Realized P&L is paired from Alpaca fills (FIFO) and excludes fees, which Alpaca's "
+        "paper API does not report. Open rows show live unrealized P&L."
+    )
+else:
+    st.info("No trades recorded yet.")
 
 # Orders History
 st.markdown("#### Recent orders")
