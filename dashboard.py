@@ -57,6 +57,8 @@ st.markdown(
         color: #edf2ed;
     }
     [data-testid="stHeader"] { background: rgba(16, 23, 20, 0.72); }
+    .stMainBlockContainer,
+    [data-testid="stMain"] .block-container,
     [data-testid="stAppViewContainer"] .main .block-container {
         max-width: 1500px;
         padding: 2rem 2.5rem 4rem;
@@ -152,12 +154,12 @@ st.markdown(
         font-size: .78rem !important;
         font-weight: 600 !important;
     }
-    [data-testid="stMetricValue"] {
+    [data-testid="stMetricValue"] p {
         color: #f0cb78 !important;
         font-size: 1.55rem !important;
         font-weight: 680 !important;
     }
-    [data-testid="stMetricDelta"] { font-size: .78rem !important; }
+    [data-testid="stMetricDelta"] p { font-size: .78rem !important; }
     [data-testid="stDataFrame"], [data-testid="stTable"] {
         border: 1px solid rgba(255,255,255,.08);
         border-radius: 14px;
@@ -185,10 +187,84 @@ st.markdown(
         background: rgba(24,33,29,.62);
     }
     hr { border-color: rgba(255,255,255,.08) !important; }
+
+    /* --- Mobile / small tablet --- */
     @media (max-width: 700px) {
-        [data-testid="stAppViewContainer"] .main .block-container { padding: 1rem 1rem 3rem; }
-        .hero { align-items: flex-start; flex-direction: column; padding: 1.35rem; }
-        .hero-right { align-items: flex-start; }
+        .stMainBlockContainer,
+        [data-testid="stMain"] .block-container,
+        [data-testid="stAppViewContainer"] .main .block-container {
+            max-width: 100%;
+            padding: 3.6rem .85rem 2.5rem !important;
+        }
+        [data-testid="stHeader"] { height: 2.85rem; }
+
+        .hero {
+            align-items: flex-start;
+            flex-direction: column;
+            gap: .9rem;
+            margin: .25rem 0 1.1rem;
+            padding: 1.15rem 1.2rem;
+            border-radius: 16px;
+        }
+        .hero-title { font-size: 1.55rem; line-height: 1.12; }
+        .hero-copy { font-size: .86rem; }
+        .hero-right { align-items: flex-start; gap: .4rem; }
+        .status-pill { padding: .4rem .7rem; font-size: .72rem; }
+
+        h2 { font-size: 1.15rem !important; margin-top: 1rem !important; }
+        h3, h4 { font-size: 1rem !important; }
+
+        /* Stack metric rows two-up instead of one long column */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            gap: .55rem !important;
+        }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > [data-testid="stColumn"] {
+            width: auto !important;
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+        }
+        [data-testid="stMetric"] {
+            min-height: 0;
+            padding: .7rem .8rem;
+            border-radius: 12px;
+        }
+        [data-testid="stMetricLabel"] p { font-size: .7rem !important; }
+        [data-testid="stMetricValue"] p { font-size: 1.15rem !important; }
+        [data-testid="stMetricDelta"] p { font-size: .7rem !important; }
+
+        /* Full-width tap targets for controls */
+        [data-testid="stBaseButton-secondary"],
+        [data-testid="stFormSubmitButton"] button,
+        [data-testid="stSelectbox"] { width: 100% !important; }
+        [data-testid="stToggle"] { padding: .15rem 0; }
+
+        /* Tables stay scrollable rather than squashed */
+        [data-testid="stDataFrame"], [data-testid="stTable"] {
+            border-radius: 10px;
+        }
+        [data-testid="stDataFrame"] { max-width: 100%; overflow-x: auto; }
+        [data-testid="stPlotlyChart"], [data-testid="stVegaLiteChart"] {
+            padding: .25rem;
+            border-radius: 12px;
+        }
+        [data-testid="stAlert"] { font-size: .84rem; }
+        [data-testid="stJson"] { font-size: .72rem; }
+        [data-testid="stJson"] div,
+        [data-testid="stJson"] span {
+            font-size: .75rem !important;
+            overflow-wrap: break-word !important;
+            word-break: normal !important;
+        }
+    }
+
+    @media (max-width: 390px) {
+        .stMainBlockContainer,
+        [data-testid="stMain"] .block-container,
+        [data-testid="stAppViewContainer"] .main .block-container { padding: 3.5rem .6rem 2rem !important; }
+        [data-testid="stMetricValue"] p { font-size: 1rem !important; }
+        .hero-title { font-size: 1.35rem; }
     }
     </style>
     """,
@@ -374,10 +450,11 @@ st.subheader("Account Overview")
 col1, col2, col3, col4 = st.columns(4)
 account = get_account()
 if account:
+    account_status = str(account.status).split(".")[-1].replace("_", " ").title()
     col1.metric("Equity", f"${float(account.equity):,.2f}")
     col2.metric("Cash", f"${float(account.cash):,.2f}")
     col3.metric("Buying Power", f"${float(account.buying_power):,.2f}")
-    col4.metric("Status", str(account.status))
+    col4.metric("Status", account_status)
 else:
     col1.metric("Equity", "$100,000.00")
     col2.metric("Cash", "$100,000.00")
@@ -434,8 +511,8 @@ if trade_rows:
     trade_summary = summarize_trades(trade_rows)
     avg_win = trade_summary["avg_win"]
     avg_loss = trade_summary["avg_loss"]
-    avg_win_label = f"${avg_win:,.2f}" if avg_win is not None else "—"
-    avg_loss_label = f"${avg_loss:,.2f}" if avg_loss is not None else "—"
+    avg_win_label = f"${avg_win:,.0f}" if avg_win is not None else "—"
+    avg_loss_label = f"-${abs(avg_loss):,.0f}" if avg_loss is not None else "—"
     p1, p2, p3, p4 = st.columns(4)
     p1.metric("Realized P&L", f"${trade_summary['realized_pnl']:+,.2f}")
     p2.metric("Closed trades", trade_summary["closed_count"])
