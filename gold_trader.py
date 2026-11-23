@@ -15,6 +15,7 @@ import hashlib
 import threading
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from bot_state import _get_bot_state
@@ -22,6 +23,13 @@ from bot_state import _get_bot_state
 load_dotenv()
 
 DEFAULT_TRADING_SYMBOLS = ("GLD", "BTC/USD")
+
+# US equity market timezone and end-of-week auto-close behavior.
+EASTERN_TIMEZONE = ZoneInfo("America/New_York")
+DEFAULT_FRIDAY_CLOSE_SYMBOLS = ("GLD",)
+# Close positions this many minutes before the final session's closing bell so the
+# market order has time to fill before the auction.
+WEEKEND_FLATTEN_MINUTES_BEFORE_CLOSE = 10
 
 
 def normalize_trading_symbol(symbol):
@@ -41,6 +49,19 @@ def get_trading_symbols():
     symbols = [normalize_trading_symbol(symbol) for symbol in configured_symbols.split(",")]
     if not symbols or any(not symbol for symbol in symbols):
         raise ValueError("TRADING_SYMBOLS must contain one or more comma-separated symbols.")
+    return list(dict.fromkeys(symbols))
+
+
+def get_friday_close_symbols():
+    """Symbols that should be flattened ahead of the weekend (last trading day of the week)."""
+    configured_symbols = os.getenv("FRIDAY_CLOSE_SYMBOLS")
+    if configured_symbols is None:
+        return list(DEFAULT_FRIDAY_CLOSE_SYMBOLS)
+
+    symbols = [normalize_trading_symbol(symbol) for symbol in configured_symbols.split(",")]
+    symbols = [symbol for symbol in symbols if symbol]
+    if not symbols:
+        raise ValueError("FRIDAY_CLOSE_SYMBOLS must contain one or more comma-separated symbols.")
     return list(dict.fromkeys(symbols))
 
 
@@ -150,6 +171,22 @@ class GoldTrader:
         self.target_atr_multiple = 3.0
         self.risk_pct = 0.01
         self.bar_minutes = 15
+
+        # End-of-week auto-close (no position carried over the weekend).
+        # Crypto trades 24/7, so this applies to non-crypto symbols only.
+        self.auto_flatten_weekend = (
+            self.symbol in get_friday_close_symbols() and not self.is_crypto
+        )
+        self.weekend_flatten_minutes_before_close = WEEKEND_FLATTEN_MINUTES_BEFORE_CLOSE
+        self._flattened_date = None
+        self._last_trading_day_cache = None
+        if self.auto_flatten_weekend:
+            logger.info(
+                "%s will be flattened before the weekend (last trading day of the week, "
+                "within %s minutes of that session's close).",
+                self.symbol,
+                self.weekend_flatten_minutes_before_close,
+            )
 
     def _get_data(self, limit=1000):
         """
@@ -643,6 +680,156 @@ class GoldTrader:
             logger.error(f"Trade execution failed: {e}", exc_info=True)
             return False
 
+    def _et_now(self):
+        """Current time in the US Eastern timezone (timezone-aware)."""
+        return datetime.now(timezone.utc).astimezone(EASTERN_TIMEZONE)
+
+    def _is_last_trading_day_of_week(self, et_now):
+        """True if today (ET) is the final equity session before the weekend.
+
+        Uses the Alpaca trading calendar so a Friday holiday is handled correctly:
+        the final session is then Thursday (or whichever weekday precedes the weekend).
+        """
+        today = et_now.date()
+        cached = self._last_trading_day_cache
+        if cached is not None and cached[0] == today:
+            return cached[1]
+
+        days_to_sunday = 6 - today.weekday()  # Monday=0 ... Sunday=6
+        week_end = today + timedelta(days=days_to_sunday)
+        try:
+            calendar = self.trading_client.get_calendar(
+                filters=trading_requests.GetCalendarRequest(start=today, end=week_end)
+            )
+        except Exception as exc:
+            logger.warning("Could not fetch trading calendar for weekend flatten: %s", exc)
+            return False
+
+        if isinstance(calendar, dict):
+            logger.warning("Unexpected trading calendar response: %s", calendar)
+            return False
+
+        trading_days = [entry.date for entry in calendar if getattr(entry, "date", None)]
+        if today not in trading_days:
+            self._last_trading_day_cache = (today, False)
+            return False
+
+        result = max(trading_days) == today
+        self._last_trading_day_cache = (today, result)
+        return result
+
+    def _should_flatten_for_weekend(self, et_now):
+        """True when it is time to close positions ahead of the weekend."""
+        if not self.auto_flatten_weekend:
+            return False
+        if not self.use_alpaca or not self.trading_client:
+            return False
+        if not self._is_last_trading_day_of_week(et_now):
+            return False
+
+        try:
+            clock = self.trading_client.get_clock()
+        except Exception as exc:
+            logger.warning("Could not read market clock for weekend flatten: %s", exc)
+            return False
+        if not clock.is_open or clock.next_close is None or clock.timestamp is None:
+            return False
+
+        next_close = clock.next_close
+        timestamp = clock.timestamp
+        if next_close.tzinfo is None:
+            next_close = next_close.replace(tzinfo=timezone.utc)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        minutes_to_close = (next_close - timestamp).total_seconds() / 60.0
+        return minutes_to_close <= self.weekend_flatten_minutes_before_close
+
+    def _close_position_for_weekend(self):
+        """Cancel open orders and close any open position ahead of the weekend."""
+        logger.info("Flattening %s ahead of the weekend.", self.symbol)
+        cancelled = self.close_active_orders()
+        if cancelled:
+            logger.info(
+                "Cancelled open %s orders before weekend close: %s", self.symbol, cancelled
+            )
+
+        cancel_deadline = time.monotonic() + 30
+        while self._open_symbol_orders():
+            if time.monotonic() >= cancel_deadline:
+                logger.error(
+                    "Timed out waiting for %s orders to cancel; weekend flatten aborted.",
+                    self.symbol,
+                )
+                return False
+            time.sleep(1)
+
+        try:
+            position = next(
+                (
+                    open_position
+                    for open_position in self.trading_client.get_all_positions()
+                    if open_position.symbol == self.symbol
+                ),
+                None,
+            )
+        except Exception as exc:
+            logger.error("Failed to read %s positions for weekend close: %s", self.symbol, exc)
+            return False
+
+        if position is None:
+            logger.info("No open %s position to close for the weekend.", self.symbol)
+            return True
+
+        try:
+            close_order = self.trading_client.close_position(self.symbol)
+        except Exception as exc:
+            logger.error(
+                "Failed to submit %s weekend close: %s", self.symbol, exc, exc_info=True
+            )
+            return False
+
+        close_order_id = getattr(close_order, "id", None)
+        if close_order_id is None:
+            logger.error(
+                "Alpaca did not return an order id for the %s weekend close.", self.symbol
+            )
+            return False
+
+        close_deadline = time.monotonic() + 60
+        while time.monotonic() < close_deadline:
+            try:
+                order = self.trading_client.get_order_by_id(close_order_id)
+                still_open = any(
+                    open_position.symbol == self.symbol
+                    for open_position in self.trading_client.get_all_positions()
+                )
+            except Exception as exc:
+                logger.warning("Could not poll %s weekend close order: %s", self.symbol, exc)
+                time.sleep(1)
+                continue
+
+            status = str(getattr(order, "status", "")).split(".")[-1].lower()
+            if status == "filled" and not still_open:
+                logger.info("Closed %s position ahead of the weekend.", self.symbol)
+                return True
+            if status in {"canceled", "rejected", "expired"}:
+                logger.error(
+                    "Weekend close order %s for %s ended with status %s.",
+                    close_order_id,
+                    self.symbol,
+                    status,
+                )
+                return False
+            time.sleep(1)
+
+        logger.error(
+            "Timed out waiting for %s weekend close order %s to fill.",
+            self.symbol,
+            close_order_id,
+        )
+        return False
+
     def run(self, loop=True, interval=60):
         logger.info(f"Starting trader for {self.symbol}...")
         strategy_state = _load_strategy_state()
@@ -654,6 +841,26 @@ class GoldTrader:
                     logger.info("Bot paused via dashboard. Waiting...")
                     time.sleep(10)
                     continue
+
+                et_now = self._et_now()
+                weekend_halt = False
+                if self.auto_flatten_weekend:
+                    in_close_window = self._should_flatten_for_weekend(et_now)
+                    if in_close_window and self._flattened_date != et_now.date():
+                        logger.info(
+                            "Final session of the week and near the close; flattening %s "
+                            "so no position is carried over the weekend.",
+                            self.symbol,
+                        )
+                        if self._close_position_for_weekend():
+                            self._flattened_date = et_now.date()
+                        else:
+                            logger.warning(
+                                "Weekend flatten of %s did not complete; retrying before the close.",
+                                self.symbol,
+                            )
+                    weekend_halt = in_close_window or self._flattened_date == et_now.date()
+
                 logger.info("Fetching data...")
                 df = self._closed_bars(self._get_data(limit=1000))
                 if df.empty:
@@ -676,7 +883,15 @@ class GoldTrader:
                     )
                     signal = self._generate_signal(df)
                     if signal in ('BUY', 'SELL'):
-                        self._execute_trade(signal, df, latest_bar)
+                        if weekend_halt:
+                            logger.info(
+                                "Skipping %s signal: %s is flat for the weekend and no new "
+                                "position will be opened before the next week.",
+                                signal,
+                                self.symbol,
+                            )
+                        else:
+                            self._execute_trade(signal, df, latest_bar)
                     last_processed = latest_bar
                     _save_strategy_state_for_symbol(self.symbol, latest_bar)
 

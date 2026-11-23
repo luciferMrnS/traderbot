@@ -14,7 +14,7 @@ import threading
 import time
 from dotenv import load_dotenv
 
-from gold_trader import GoldTrader, get_trading_symbols, is_crypto_symbol
+from gold_trader import GoldTrader, get_trading_symbols, is_crypto_symbol, get_friday_close_symbols
 from bot_state import get_bot_state, set_bot_state
 from trade_history import build_trades, fetch_orders, open_position_rows, summarize_trades
 
@@ -668,6 +668,14 @@ bot_configuration["Exits"] = (
         if HAS_CRYPTO else "1.5 x ATR stop and 3 x ATR target"
     )
 )
+friday_close_symbols = [symbol for symbol in get_friday_close_symbols() if symbol in SYMBOLS]
+if friday_close_symbols:
+    bot_configuration["Weekend Flatten"] = (
+        f"{', '.join(friday_close_symbols)} is closed ~10 minutes before the close of the "
+        f"last trading day of each week (Friday, or the preceding session when Friday is a "
+        f"holiday) so no position is carried over the weekend. New entries are blocked "
+        f"for the rest of that day."
+    )
 st.json(bot_configuration)
 st.caption("Set TRADING_SYMBOLS=GLD,BTC/USD to trade both. TRADING_SYMBOL remains available for a single-symbol run.")
 st.caption("The dashboard starts one background strategy worker per symbol. Toggle 'Bot Running' to pause/resume all workers.")

@@ -66,6 +66,11 @@ def diagnose_symbol(symbol, allocation_fraction):
             "no broker-side stop/target; 1% sizing is only an ATR reference, "
             "so realized losses can be larger"
         )
+    elif t.auto_flatten_weekend:
+        print(
+            "Exit: 1.5 x ATR(14) stop and 3 x ATR(14) target; also flattened ~10 minutes "
+            "before the close of the last trading day of each week (no weekend carry)"
+        )
     else:
         print("Stop: 1.5 x ATR(14); target: 3 x ATR(14); risk budget: 1% of equity")
 
