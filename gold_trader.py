@@ -390,6 +390,29 @@ class GoldTrader:
         ).to_integral_value(rounding=ROUND_DOWN) * increment
         return qty if qty >= Decimal(str(min_order_size)) else Decimal("0")
 
+    def _position_matches(self, position):
+        """True when an Alpaca position belongs to this trader's symbol.
+
+        Alpaca reports crypto positions without the slash (BTCUSD) while
+        self.symbol is BTC/USD, so compare normalized symbols.
+        """
+        position_symbol = str(getattr(position, "symbol", "") or "")
+        return (
+            position_symbol.replace("/", "").upper()
+            == self.symbol.replace("/", "").upper()
+        )
+
+    def _position_for_symbol(self):
+        """Return this trader's open position, or None if flat."""
+        return next(
+            (
+                position
+                for position in self.trading_client.get_all_positions()
+                if self._position_matches(position)
+            ),
+            None,
+        )
+
     def _open_symbol_orders(self):
         return self.trading_client.get_orders(
             filter=trading_requests.GetOrdersRequest(
@@ -450,13 +473,7 @@ class GoldTrader:
             time.sleep(1)
 
         if self.is_crypto:
-            position = next(
-                (
-                    position for position in self.trading_client.get_all_positions()
-                    if position.symbol == self.symbol
-                ),
-                None,
-            )
+            position = self._position_for_symbol()
             if position is None:
                 logger.error("No %s position remains to close.", self.symbol)
                 return False
@@ -488,7 +505,7 @@ class GoldTrader:
             status = str(order.status).split(".")[-1].lower()
             positions = self.trading_client.get_all_positions()
             position_still_open = any(
-                position.symbol == self.symbol for position in positions
+                self._position_matches(position) for position in positions
             )
             if status == "filled" and not position_still_open:
                 logger.info("Closed existing %s position before reversing.", self.symbol)
@@ -534,11 +551,7 @@ class GoldTrader:
                 logger.warning("Latest completed bar is stale; skipping order submission.")
                 return False
 
-            positions = self.trading_client.get_all_positions()
-            position = next(
-                (position for position in positions if position.symbol == self.symbol),
-                None,
-            )
+            position = self._position_for_symbol()
             if self.is_crypto and signal == "SELL" and position is None:
                 logger.info("Ignoring SELL signal; Alpaca spot crypto trading is long-only.")
                 return False
@@ -569,8 +582,7 @@ class GoldTrader:
                 )
                 return False
 
-            remaining_positions = self.trading_client.get_all_positions()
-            if any(position.symbol == self.symbol for position in remaining_positions):
+            if self._position_for_symbol() is not None:
                 logger.error(
                     "A %s position remains open; refusing to submit the counter-position.",
                     self.symbol,
@@ -765,14 +777,7 @@ class GoldTrader:
             time.sleep(1)
 
         try:
-            position = next(
-                (
-                    open_position
-                    for open_position in self.trading_client.get_all_positions()
-                    if open_position.symbol == self.symbol
-                ),
-                None,
-            )
+            position = self._position_for_symbol()
         except Exception as exc:
             logger.error("Failed to read %s positions for weekend close: %s", self.symbol, exc)
             return False
@@ -801,7 +806,7 @@ class GoldTrader:
             try:
                 order = self.trading_client.get_order_by_id(close_order_id)
                 still_open = any(
-                    open_position.symbol == self.symbol
+                    self._position_matches(open_position)
                     for open_position in self.trading_client.get_all_positions()
                 )
             except Exception as exc:
