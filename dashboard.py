@@ -510,6 +510,14 @@ else:
             }
         )
     st.table(pd.DataFrame(heartbeat_rows).set_index("Symbol"))
+    worker_pids = sorted(
+        {str(beat.get("pid")) for beat in heartbeats.values() if beat.get("pid") is not None}
+    )
+    st.caption(
+        f"Worker process(es): {', '.join(worker_pids) or 'n/a'} · "
+        f"Dashboard process: {os.getpid()} · "
+        "Workers should run in the boot process (start.py) and be separate from the dashboard."
+    )
 
 # Positions Table
 st.markdown("---")
