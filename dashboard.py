@@ -509,9 +509,7 @@ else:
                 "Last error": beat.get("last_error") or "",
             }
         )
-    st.dataframe(
-        pd.DataFrame(heartbeat_rows), use_container_width=True, hide_index=True
-    )
+    st.table(pd.DataFrame(heartbeat_rows).set_index("Symbol"))
 
 # Positions Table
 st.markdown("---")
