@@ -70,7 +70,18 @@ def is_crypto_symbol(symbol):
 
 
 STRATEGY_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_state.json")
+HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_heartbeat.json")
 _STRATEGY_STATE_LOCK = threading.Lock()
+_HEARTBEAT_LOCK = threading.Lock()
+
+
+def _quarantine_file(path):
+    """Move an unreadable file aside so the next write starts from a clean slate."""
+    try:
+        os.replace(path, f"{path}.corrupt")
+    except OSError:
+        pass
+
 
 def _load_strategy_state():
     try:
@@ -78,13 +89,31 @@ def _load_strategy_state():
             state = json.load(f)
     except FileNotFoundError:
         return {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(
+            "Strategy state file %s is unreadable; moving it aside and starting fresh.",
+            STRATEGY_STATE_FILE,
+        )
+        _quarantine_file(STRATEGY_STATE_FILE)
+        return {}
     if not isinstance(state, dict):
-        raise ValueError(f"Invalid strategy state in {STRATEGY_STATE_FILE}")
+        logger.warning(
+            "Strategy state file %s does not contain a JSON object; moving it aside.",
+            STRATEGY_STATE_FILE,
+        )
+        _quarantine_file(STRATEGY_STATE_FILE)
+        return {}
     return state
 
 def _save_strategy_state(state):
-    with open(STRATEGY_STATE_FILE, "w", encoding="utf-8") as f:
+    # Write atomically: a restart mid-write must not leave a truncated file that
+    # would kill both workers on their next start.
+    temporary_file = f"{STRATEGY_STATE_FILE}.tmp"
+    with open(temporary_file, "w", encoding="utf-8") as f:
         json.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_file, STRATEGY_STATE_FILE)
 
 
 def _save_strategy_state_for_symbol(symbol, latest_bar):
@@ -92,6 +121,49 @@ def _save_strategy_state_for_symbol(symbol, latest_bar):
         state = _load_strategy_state()
         state[symbol] = latest_bar
         _save_strategy_state(state)
+
+
+def _write_heartbeat(symbol, *, status, last_bar=None, last_signal=None, last_error=None):
+    """Publish worker liveness for the dashboard.
+
+    The strategy workers and the Streamlit dashboard run in separate processes on
+    the same machine, so they share this file instead of in-process state.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with _HEARTBEAT_LOCK:
+        try:
+            with open(HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+                heartbeat = json.load(f)
+            if not isinstance(heartbeat, dict):
+                heartbeat = {}
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+            heartbeat = {}
+
+        entry = heartbeat.get(symbol) or {}
+        entry.update(
+            {
+                "pid": os.getpid(),
+                "thread": threading.current_thread().name,
+                "status": status,
+                "last_loop": timestamp,
+                "last_error": last_error,
+            }
+        )
+        if last_bar is not None:
+            entry["last_bar"] = str(last_bar)
+        if last_signal is not None:
+            entry["last_signal"] = last_signal
+        heartbeat[symbol] = entry
+
+        temporary_file = f"{HEARTBEAT_FILE}.tmp"
+        try:
+            with open(temporary_file, "w", encoding="utf-8") as f:
+                json.dump(heartbeat, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_file, HEARTBEAT_FILE)
+        except OSError as exc:
+            logger.warning("Could not write bot heartbeat: %s", exc)
 
 
 # Configure Logging
@@ -839,14 +911,17 @@ class GoldTrader:
         logger.info(f"Starting trader for {self.symbol}...")
         strategy_state = _load_strategy_state()
         last_processed = strategy_state.get(self.symbol)
+        _write_heartbeat(self.symbol, status="starting", last_bar=last_processed)
 
         while loop:
             try:
                 if not _get_bot_state():
+                    _write_heartbeat(self.symbol, status="paused")
                     logger.info("Bot paused via dashboard. Waiting...")
                     time.sleep(10)
                     continue
 
+                _write_heartbeat(self.symbol, status="running")
                 et_now = self._et_now()
                 weekend_halt = False
                 if self.auto_flatten_weekend:
@@ -870,6 +945,7 @@ class GoldTrader:
                 df = self._closed_bars(self._get_data(limit=1000))
                 if df.empty:
                     logger.warning("No completed 15-minute bars received. Retrying.")
+                    _write_heartbeat(self.symbol, status="no-data")
                     time.sleep(30)
                     continue
 
@@ -880,6 +956,7 @@ class GoldTrader:
                     last_processed = latest_bar
                     strategy_state[self.symbol] = latest_bar
                     _save_strategy_state_for_symbol(self.symbol, latest_bar)
+                    _write_heartbeat(self.symbol, status="running", last_bar=latest_bar)
                 elif latest_bar != last_processed:
                     logger.info(
                         "Latest closed 15-minute bar: %s, close=$%.2f",
@@ -899,6 +976,12 @@ class GoldTrader:
                             self._execute_trade(signal, df, latest_bar)
                     last_processed = latest_bar
                     _save_strategy_state_for_symbol(self.symbol, latest_bar)
+                    _write_heartbeat(
+                        self.symbol,
+                        status="running",
+                        last_bar=latest_bar,
+                        last_signal=signal,
+                    )
 
                 if not loop:
                     break
@@ -911,6 +994,7 @@ class GoldTrader:
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
+                _write_heartbeat(self.symbol, status="error", last_error=str(e))
                 time.sleep(10)
 
 if __name__ == "__main__":

@@ -2,7 +2,8 @@
 .env
 __pycache__/
 *.pyc
-strategy_state.json
+strategy_state.json*
+bot_heartbeat.json*
 st.log
 st.err
 pip_st.log

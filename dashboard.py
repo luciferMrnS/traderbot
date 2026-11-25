@@ -9,12 +9,19 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from datetime import datetime, timedelta
 import os
+import json
 import yfinance as yf
 import threading
 import time
 from dotenv import load_dotenv
 
-from gold_trader import GoldTrader, get_trading_symbols, is_crypto_symbol, get_friday_close_symbols
+from gold_trader import (
+    GoldTrader,
+    HEARTBEAT_FILE,
+    get_friday_close_symbols,
+    get_trading_symbols,
+    is_crypto_symbol,
+)
 from bot_state import get_bot_state, set_bot_state
 from trade_history import build_trades, fetch_orders, open_position_rows, summarize_trades
 
@@ -298,8 +305,11 @@ def start_bot_threads():
         thread.start()
     return threads
 
-# Initialize bot thread on app startup
-start_bot_threads()
+# Initialize bot threads only when the dashboard owns them. When the service is
+# booted through start.py the workers are already running and must not be
+# duplicated.
+if os.getenv("BOT_MANAGED_EXTERNALLY") != "1":
+    start_bot_threads()
 
 # --- Config ---
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -353,6 +363,14 @@ def get_recent_orders(limit=10):
         return trading_cli.get_orders(status="all", limit=limit)
     except:
         return []
+
+def load_heartbeats():
+    try:
+        with open(HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 def pnl_color(value):
     if value < 0:
@@ -460,6 +478,40 @@ else:
     col2.metric("Cash", "$100,000.00")
     col3.metric("Buying Power", "$200,000.00")
     col4.metric("Status", "Demo")
+
+# Worker heartbeat: proves the strategy threads are alive even when nobody is
+# trading, and makes a dormant bot obvious instead of guessing from order flow.
+st.markdown("---")
+st.subheader("Bot Heartbeat")
+heartbeats = load_heartbeats()
+if not heartbeats:
+    st.warning(
+        "No worker heartbeat found. The strategy workers are probably not running "
+        "(start the service with start.py so they boot without a browser session)."
+    )
+else:
+    now_utc = pd.Timestamp.now(tz="UTC")
+    heartbeat_rows = []
+    for symbol in SYMBOLS:
+        beat = heartbeats.get(symbol) or {}
+        last_loop = pd.to_datetime(beat.get("last_loop"), utc=True, errors="coerce")
+        age_seconds = (now_utc - last_loop).total_seconds() if pd.notna(last_loop) else None
+        status = str(beat.get("status", "missing")).upper()
+        if age_seconds is not None and age_seconds > 180 and status != "PAUSED":
+            status = f"{status} (STALE)"
+        heartbeat_rows.append(
+            {
+                "Symbol": symbol,
+                "Status": status,
+                "Heartbeat age": f"{int(age_seconds)}s" if age_seconds is not None else "n/a",
+                "Last processed bar": beat.get("last_bar", "n/a"),
+                "Last signal": beat.get("last_signal", "n/a"),
+                "Last error": beat.get("last_error") or "",
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(heartbeat_rows), use_container_width=True, hide_index=True
+    )
 
 # Positions Table
 st.markdown("---")
@@ -678,7 +730,7 @@ if friday_close_symbols:
     )
 st.json(bot_configuration)
 st.caption("Set TRADING_SYMBOLS=GLD,BTC/USD to trade both. TRADING_SYMBOL remains available for a single-symbol run.")
-st.caption("The dashboard starts one background strategy worker per symbol. Toggle 'Bot Running' to pause/resume all workers.")
+st.caption("The service starts one strategy worker per symbol at boot (start.py). Toggle 'Bot Running' to pause/resume all workers.")
 
 # Auto-Refresh Logic
 if auto_refresh and connected:
