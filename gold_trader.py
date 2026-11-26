@@ -22,7 +22,11 @@ from bot_state import _get_bot_state
 
 load_dotenv()
 
-DEFAULT_TRADING_SYMBOLS = ("GLD", "BTC/USD")
+DEFAULT_TRADING_SYMBOLS = ("GLD",)
+
+# BTC/USD is disabled for now: we are trading GLD only. Keep this list explicit so
+# a stale deploy env (or a bare symbol override) cannot restart BTC trading.
+DISABLED_TRADING_SYMBOLS = frozenset({"BTC/USD"})
 
 # US equity market timezone and end-of-week auto-close behavior.
 EASTERN_TIMEZONE = ZoneInfo("America/New_York")
@@ -49,6 +53,14 @@ def get_trading_symbols():
     symbols = [normalize_trading_symbol(symbol) for symbol in configured_symbols.split(",")]
     if not symbols or any(not symbol for symbol in symbols):
         raise ValueError("TRADING_SYMBOLS must contain one or more comma-separated symbols.")
+    symbols = [
+        symbol for symbol in symbols
+        if symbol not in DISABLED_TRADING_SYMBOLS
+    ]
+    if not symbols:
+        # A BTC-only config must never restart BTC trading; fall back to the
+        # GLD default so the service stays up with an allowed symbol.
+        symbols = list(DEFAULT_TRADING_SYMBOLS)
     return list(dict.fromkeys(symbols))
 
 
@@ -594,6 +606,12 @@ class GoldTrader:
         return False
 
     def _execute_trade(self, signal, df, signal_bar_time=None):
+        # Hard stop: never open a BTC/USD position from the strategy, even if a
+        # trader instance was created directly with that symbol.
+        if self.symbol in DISABLED_TRADING_SYMBOLS:
+            logger.info("Skipping %s signal: %s trading is disabled.", signal, self.symbol)
+            return False
+
         last = df.iloc[-1]
         current_price = float(last['Close'])
         atr = float(last['ATR'])
